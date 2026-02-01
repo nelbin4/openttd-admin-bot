@@ -1257,6 +1257,7 @@ class OpenTTDBot:
 
 
 if __name__ == "__main__":
+    # meh, i hate people who sell free stuff, this is free! get at: https://github.com/nelbin4/openttd-admin-bot/
     logger.info("=== OpenTTD Admin Bot Starting ===")
     bot = OpenTTDBot()
     bot.start()
