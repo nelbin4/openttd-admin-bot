@@ -135,7 +135,6 @@ Best: mount your edited `main.py` into `/app/main.py`.
 
 ## Important
 
-- Bot **cannot** read `openttd.cfg` → hardcode correct IP/port/pass.
 - `LOAD_SCENARIO` must exist in OpenTTD’s **content_download/scenario** folder.
 - Strong admin password required — anyone with it owns the server.
 - `DEBUG=True` produces lots of output — turn off in production.
