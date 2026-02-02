@@ -22,7 +22,7 @@ class Config:
     ADMIN_PASS: str = "PASSWORDPASSWORD"
     GOAL_VALUE: int = 10_000_000_000
     LOAD_SCENARIO: str = "flat2048prodboost.scn"
-    DEBUG: bool = True
+    DEBUG: bool = False
     DEAD_CO_AGE: int = 5
     DEAD_CO_VALUE: int = 5_000_000
 
@@ -1121,9 +1121,9 @@ class OpenTTDBot:
         info = [
             "=== Server Info ===",
             "South-East-Asia OpenTTD Server",
-            "Gamescript: Production Booster on primary industries",
-            "Transport >70% boosts production, <50% reduces",
-            f"Goal: First company value ${self._fmt(cfg.GOAL_VALUE)} wins"
+            "Gamescript: Production Booster",
+            "Primary industries transported: >70% increases, <50% reduces",
+            f"Goal: First company value reach ${self._fmt(cfg.GOAL_VALUE)} wins, map resets"
         ]
         self.send_msg('\n'.join(info), cid)
 
@@ -1134,7 +1134,7 @@ class OpenTTDBot:
             "2. No blocking players",
             "3. No cheating/exploits",
             "4. Be respectful",
-            f"5. Inactive >{cfg.DEAD_CO_AGE}y & <${self._fmt(cfg.DEAD_CO_VALUE)} auto-reset",
+            f"5. Inactive company >{cfg.DEAD_CO_AGE}y & <${self._fmt(cfg.DEAD_CO_VALUE)} auto-reset",
             "6. Admin decisions final"
         ]
         self.send_msg('\n'.join(rules), cid)
@@ -1157,7 +1157,7 @@ class OpenTTDBot:
         
         for i, (co_id, data) in enumerate(sorted_cos[:10], 1):
             pct = (data['value'] / cfg.GOAL_VALUE) * 100
-            lines.append(f"{i}. {data['name']} (#{data['display_id']}): ${self._fmt(data['value'])} ({pct:.1f}%)")
+            lines.append(f"{i}.) {data['name']}: ${self._fmt(data['value'])} ({pct:.1f}%)")
         
         self.send_msg('\n'.join(lines), cid)
 
@@ -1257,7 +1257,6 @@ class OpenTTDBot:
 
 
 if __name__ == "__main__":
-    # meh, i hate people who sell free stuff, this is free! get at: https://github.com/nelbin4/openttd-admin-bot/
     logger.info("=== OpenTTD Admin Bot Starting ===")
     bot = OpenTTDBot()
     bot.start()
