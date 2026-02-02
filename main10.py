@@ -209,6 +209,7 @@ class RconHandler:
         self.buffer = []
         self.inflight = False
         self.end_ts = None
+        self.current_cmd = None
         self.circuit_breaker = CircuitBreaker(CIRCUIT_BREAKER_THRESHOLD, CIRCUIT_BREAKER_TIMEOUT)
         self.main_thread = threading.current_thread()
     
@@ -269,7 +270,15 @@ class RconHandler:
         
         with self.lock:
             while self.inflight:
+                if deadline - time.time() <= 1.0:
+                    self.logger.warning("RCON wait nearing timeout; current_cmd=%s blocking new cmd=%s", self.current_cmd, cmd)
                 if time.time() >= deadline:
+                    self.logger.warning("RCON wait timeout; force-clearing inflight for cmd=%s (stuck on %s)", cmd, self.current_cmd)
+                    self.inflight = False
+                    self.current_cmd = None
+                    self.buffer.clear()
+                    self.end_ts = None
+                    self.cv.notify_all()
                     raise Exception(f"RCON wait timeout: {cmd}")
                 self.cv.wait(0.2)
             
@@ -280,6 +289,7 @@ class RconHandler:
             self.buffer.clear()
             self.inflight = True
             self.end_ts = None
+            self.current_cmd = cmd
             self.admin.send_rcon(cmd)
         
         if threading.current_thread() is self.main_thread:
@@ -294,11 +304,13 @@ class RconHandler:
             with self.lock:
                 if not self.inflight and self.end_ts:
                     if time.time() - self.end_ts >= RCON_GRACE:
+                        self.current_cmd = None
                         return '\n'.join(self.buffer)
             time.sleep(0.01)
         
         with self.lock:
             self.inflight = False
+            self.current_cmd = None
             self.cv.notify_all()
         raise Exception(f"RCON timeout: {cmd}")
     
@@ -307,9 +319,11 @@ class RconHandler:
             while time.time() < deadline:
                 if not self.inflight and self.end_ts:
                     if time.time() - self.end_ts >= RCON_GRACE:
+                        self.current_cmd = None
                         return '\n'.join(self.buffer)
                 self.cv.wait(0.2)
             self.inflight = False
+            self.current_cmd = None
         raise Exception(f"RCON timeout: {cmd}")
     
     def on_rcon(self, text):
@@ -325,6 +339,7 @@ class RconHandler:
             if self.inflight:
                 self.end_ts = time.time()
                 self.inflight = False
+                self.logger.debug("RCON end received for cmd=%s", self.current_cmd)
                 self.cv.notify_all()
     
     def batch_execute(self, commands):
