@@ -7,5 +7,10 @@
   "load_scenario": "flat2048prodboost.scn",
   "goal_value": 100000000000,
   "dead_co_age": 5,
-  "dead_co_value": 5000000
+  "dead_co_value": 5000000,
+  "rcon_retry_max": 3,
+  "rcon_retry_delay": 0.5,
+  "reconnect_max_attempts": 10,
+  "reconnect_delay": 5.0,
+  "reset_countdown_seconds": 20
 }
