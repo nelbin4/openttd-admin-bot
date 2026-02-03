@@ -1,4 +1,3 @@
-# this is for 10 servers to admin. rename main10.py to main.py and include settings.json(adjust settings there)
 import json
 import logging
 import re
@@ -19,26 +18,12 @@ from pyopenttdadmin import Admin, openttdpacket, AdminUpdateType, AdminUpdateFre
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
+
 @dataclass
 class Config:
-    admin_port: int
-    game_port: int
-    server_num: int
-    server_ip = ""
-    admin_name = ""
-    admin_pass = ""
-    goal_value = 100_000_000_000
-    load_scenario = "flat2048prodboost.scn"
-    dead_co_age = 5
-    dead_co_value = 5_000_000
-    rcon_retry_max = 3
-    rcon_retry_delay = 0.5
-    reconnect_max_attempts = 10
-    reconnect_delay = 5.0
-
-
-GAME_START_YEAR = 1950
-RESET_COUNTDOWN_SECONDS = 20
+    admin_port: int; game_port: int; server_num: int; server_ip: str; admin_name: str
+    admin_pass: str; goal_value: int; load_scenario: str; dead_co_age: int; dead_co_value: int
+    rcon_retry_max: int; rcon_retry_delay: float; reconnect_max_attempts: int; reconnect_delay: float; reset_countdown_seconds: int
 
 
 def load_settings(path="settings.json"):
@@ -62,20 +47,57 @@ def build_server_configs(settings):
     configs = []
     for idx, admin_port in enumerate(admin_ports):
         game_port = game_ports[idx] if game_ports else 0
-        cfg = Config(admin_port=admin_port, game_port=game_port, server_num=idx + 1)
-        cfg.server_ip = settings.get("server_ip", cfg.server_ip)
-        cfg.admin_name = settings.get("admin_name", cfg.admin_name)
-        cfg.admin_pass = settings.get("admin_pass", cfg.admin_pass)
-        cfg.goal_value = settings.get("goal_value", cfg.goal_value)
-        cfg.load_scenario = settings.get("load_scenario", cfg.load_scenario)
-        cfg.dead_co_age = settings.get("dead_co_age", cfg.dead_co_age)
-        cfg.dead_co_value = settings.get("dead_co_value", cfg.dead_co_value)
+        server_ip = settings.get("server_ip")
+        admin_name = settings.get("admin_name")
+        admin_pass = settings.get("admin_pass")
+        goal_value = settings.get("goal_value")
+        load_scenario = settings.get("load_scenario")
+        dead_co_age = settings.get("dead_co_age")
+        dead_co_value = settings.get("dead_co_value")
+        rcon_retry_max = settings.get("rcon_retry_max")
+        rcon_retry_delay = settings.get("rcon_retry_delay")
+        reconnect_max_attempts = settings.get("reconnect_max_attempts")
+        reconnect_delay = settings.get("reconnect_delay")
+        reset_countdown_seconds = settings.get("reset_countdown_seconds")
+
+        required = {
+            "server_ip": server_ip,
+            "admin_name": admin_name,
+            "admin_pass": admin_pass,
+            "goal_value": goal_value,
+            "load_scenario": load_scenario,
+            "dead_co_age": dead_co_age,
+            "dead_co_value": dead_co_value,
+            "rcon_retry_max": rcon_retry_max,
+            "rcon_retry_delay": rcon_retry_delay,
+            "reconnect_max_attempts": reconnect_max_attempts,
+            "reconnect_delay": reconnect_delay,
+            "reset_countdown_seconds": reset_countdown_seconds,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            raise ValueError(f"Server {idx+1}: Missing required settings: {', '.join(missing)}")
+
+        cfg = Config(
+            admin_port=admin_port,
+            game_port=game_port,
+            server_num=idx + 1,
+            server_ip=server_ip,
+            admin_name=admin_name,
+            admin_pass=admin_pass,
+            goal_value=int(goal_value),
+            load_scenario=str(load_scenario),
+            dead_co_age=int(dead_co_age),
+            dead_co_value=int(dead_co_value),
+            rcon_retry_max=int(rcon_retry_max),
+            rcon_retry_delay=float(rcon_retry_delay),
+            reconnect_max_attempts=int(reconnect_max_attempts),
+            reconnect_delay=float(reconnect_delay),
+            reset_countdown_seconds=int(reset_countdown_seconds),
+        )
         configs.append(cfg)
     return configs
 
-
-SETTINGS = load_settings()
-SERVERS = build_server_configs(SETTINGS)
 
 CACHE_TTL = 30.0
 CACHE_MAX_SIZE = 500
@@ -112,6 +134,9 @@ GETDATE_RE = re.compile(r"Date:\s*(\d{4}-\d{2}-\d{2})")
 class Constants(Enum):
     UNNAMED_COMPANY = "unnamed"
     SPECTATOR_ID = 255
+
+
+SPECTATOR_ID = Constants.SPECTATOR_ID.value
 
 
 class GamePhase(Enum):
@@ -162,11 +187,11 @@ class LRUCache:
         with self.lock:
             if key in self.cache:
                 del self.cache[key]
+            elif len(self.cache) >= self.max_size:
+                self.cache.popitem(last=False)
             entry = CacheEntry(value, self.ttl)
             self.cache[key] = entry
             self.cache.move_to_end(key)
-            if len(self.cache) > self.max_size:
-                self.cache.popitem(last=False)
     
     def delete(self, key):
         with self.lock:
@@ -214,11 +239,13 @@ class CircuitBreaker:
                     self.failures = 0
                 else:
                     raise Exception("Circuit breaker is open")
-        
+            current_state = (self.is_open, self.failures)
+
         try:
             result = func(*args, **kwargs)
             with self.lock:
                 self.failures = 0
+                self.is_open = False
             return result
         except Exception as e:
             with self.lock:
@@ -550,7 +577,7 @@ class YesCommand(CommandHandler):
             return
         
         self.bot.logger.info("Reset confirm: c=%d co=%d", cid, pending_co_id)
-        self.bot.rcon.execute(f'move {cid} {Constants.SPECTATOR_ID.value}', escape_args=False)
+        self.bot.rcon.execute(f'move {cid} {SPECTATOR_ID}', escape_args=False)
         time.sleep(0.2)
         
         self.bot.rcon.execute(f"reset_company {pending_co_id}", escape_args=False)
@@ -563,7 +590,7 @@ class YesCommand(CommandHandler):
 
 
 class OpenTTDBot:
-    def __init__(self, cfg):
+    def __init__(self, cfg, total_servers=1):
         self.cfg = cfg
         self.logger = logging.getLogger(f"[S{self.cfg.server_num}]")
         self._validate_config()
@@ -601,7 +628,7 @@ class OpenTTDBot:
         self.command_cooldown = {}
         self.command_cooldown_lock = threading.Lock()
         
-        worker_count = min(max(2, len(SERVERS)), 8)
+        worker_count = min(max(2, total_servers), 8)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=worker_count,
             thread_name_prefix=f"Bot{cfg.server_num}"
@@ -873,7 +900,6 @@ class OpenTTDBot:
         self.logger.info("New game/map detected")
         time.sleep(0.5)
         self.companies_cache.clear()
-        self.clients_cache.clear()
         self.cache_ts = 0.0
         self.state_initialized = False
         self._cleanup_unnamed_company()
@@ -1014,9 +1040,9 @@ class OpenTTDBot:
                 except ValueError:
                     return int(year_str.split('-')[0])
         if companies:
-            max_year = max((co.get("start_date", 0) for co in companies.values()), default=GAME_START_YEAR)
+            max_year = max((co.get("start_date", 0) for co in companies.values()), default=1950)
             return int(max_year)
-        return GAME_START_YEAR
+        return 1950
     
     def _update_companies_from_rcon(self, reason=""):
         output = self.rcon.execute('companies')
@@ -1114,60 +1140,7 @@ class OpenTTDBot:
             with self.paused_lock:
                 self.paused = False
             self.logger.info("Game unpaused: %d active companies", len(active_companies))
-    
-    def _do_pause(self):
-        with self.pause_timer_lock:
-            self.pause_timer = None
-        
-        with self.paused_lock:
-            already_paused = self.paused
-        if not already_paused:
-            self.rcon.execute('pause')
-            with self.paused_lock:
-                self.paused = True
-            self.logger.info("Game paused: no active companies")
-    
-    def _transition_phase(self, new_phase):
-        if self.phase == new_phase:
-            return True
-        
-        if self.phase.can_transition_to(new_phase):
-            old_phase = self.phase
-            self.phase = new_phase
-            self.logger.info("Phase transition: %s -> %s", old_phase.value, new_phase.value)
-            return True
-        else:
-            self.logger.warning("Invalid phase transition: %s -> %s", self.phase.value, new_phase.value)
-            return False
-    
-    def _load_scenario(self):
-        self.logger.info("Loading: %s", self.cfg.load_scenario)
-        resp = self.rcon.execute(f"load_scenario {self.cfg.load_scenario}", escape_args=False)
-        
-        if resp and "cannot be found" in resp.lower():
-            self.logger.error("Scenario not found: %s", self.cfg.load_scenario)
-            return False
-        
-        self.companies_cache.clear()
-        self.cache_ts = 0.0
-        
-        self.logger.info("Scenario loaded: %s", self.cfg.load_scenario)
-        time.sleep(0.5)
-        self._cleanup_unnamed_company()
-        return True
-    
-    def send_msg(self, msg, cid=None):
-        for line in msg.split('\n'):
-            try:
-                if cid:
-                    self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
-                                   desttype=openttdpacket.ChatDestTypes.CLIENT, id=cid)
-                else:
-                    self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
-                                   desttype=openttdpacket.ChatDestTypes.BROADCAST)
-            except Exception as e:
-                self.logger.error("Send failed: %s", e)
-            time.sleep(MSG_RATE_LIMIT)
+
     
     def _game_monitor_loop(self):
         self.logger.info("Monitor loop start")
@@ -1200,6 +1173,47 @@ class OpenTTDBot:
             self.logger.error("Monitor error: %s", e)
             return MONITOR_INTERVAL_DEFAULT
     
+    def send_msg(self, msg, cid=None):
+        for line in msg.split('\n'):
+            try:
+                if cid:
+                    self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
+                                   desttype=openttdpacket.ChatDestTypes.CLIENT, id=cid)
+                else:
+                    self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
+                                   desttype=openttdpacket.ChatDestTypes.BROADCAST)
+            except Exception as e:
+                self.logger.error("Send failed: %s", e)
+            time.sleep(MSG_RATE_LIMIT)
+
+    def _do_pause(self):
+        with self.pause_timer_lock:
+            self.pause_timer = None
+        
+        with self.paused_lock:
+            already_paused = self.paused
+        if not already_paused:
+            self.rcon.execute('pause')
+            with self.paused_lock:
+                self.paused = True
+            self.logger.info("Game paused: no active companies")
+
+    def _load_scenario(self):
+        self.logger.info("Loading: %s", self.cfg.load_scenario)
+        resp = self.rcon.execute(f"load_scenario {self.cfg.load_scenario}", escape_args=False)
+        
+        if resp and "cannot be found" in resp.lower():
+            self.logger.error("Scenario not found: %s", self.cfg.load_scenario)
+            return False
+        
+        self.companies_cache.clear()
+        self.cache_ts = 0.0
+        
+        self.logger.info("Scenario loaded: %s", self.cfg.load_scenario)
+        time.sleep(0.5)
+        self._cleanup_unnamed_company()
+        return True
+
     def _check_goal(self, companies):
         if not companies:
             return MONITOR_INTERVAL_NO_CO
@@ -1214,7 +1228,8 @@ class OpenTTDBot:
 
                 self.logger.info("GOAL! %s=$%s", top['name'], self._fmt(top['value']))
                 transitioned = self._transition_phase(GamePhase.GOAL_REACHED)
-            if transitioned:
+                should_handle = transitioned
+            if should_handle:
                 self._handle_goal(top['name'], top['value'])
             return MONITOR_INTERVAL_DEFAULT
         
@@ -1234,7 +1249,7 @@ class OpenTTDBot:
         
         for co_id, co_data in companies.items():
             founded = co_data.get('start_date')
-            if not founded or founded <= GAME_START_YEAR:
+            if not founded or founded <= 1950:
                 continue
             
             age = year - founded
@@ -1276,7 +1291,7 @@ class OpenTTDBot:
                 self.logger.info("Cleanup: co=%d n=%s cl=%d", co_id, name, len(co_clients))
                 
                 for cid in co_clients:
-                    self.rcon.execute(f'move {cid} {Constants.SPECTATOR_ID.value}', escape_args=False)
+                    self.rcon.execute(f'move {cid} {SPECTATOR_ID}', escape_args=False)
                     time.sleep(0.02)
                 
                 self.rcon.execute(f"reset_company {co_id}", escape_args=False)
@@ -1296,12 +1311,10 @@ class OpenTTDBot:
                     return
                 self._transition_phase(GamePhase.RESETTING)
 
-            msg = (
-                "=== GOAL ACHIEVED ===\n"
-                f"Winner: {winner}\n"
-                f"Goal: ${self._fmt(self.cfg.goal_value)}\n"
-                f"Map restart in {RESET_COUNTDOWN_SECONDS}s..."
-            )
+            msg = f"""=== GOAL ACHIEVED ===
+Winner: {winner}
+Goal: ${self._fmt(self.cfg.goal_value)}
+Map restart in {self.cfg.reset_countdown_seconds}s..."""
             self.send_msg(msg)
             threading.Thread(target=self._reset_countdown, daemon=True).start()
         except Exception:
@@ -1309,8 +1322,8 @@ class OpenTTDBot:
     
     def _reset_countdown(self):
         try:
-            self.logger.info("Reset countdown: %ds", RESET_COUNTDOWN_SECONDS)
-            for i in range(RESET_COUNTDOWN_SECONDS, 0, -1):
+            self.logger.info("Reset countdown: %ds", self.cfg.reset_countdown_seconds)
+            for i in range(self.cfg.reset_countdown_seconds, 0, -1):
                 if i in (10, 5):
                     self.send_msg(f"Map reset in {i}s...")
                 if self.stop_event.wait(1):
@@ -1409,21 +1422,35 @@ def signal_handler(signum, frame):
 
 _running_bots = []
 
-if __name__ == '__main__':
+
+def main():
+    settings = load_settings()
+    servers = build_server_configs(settings)
+
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-    
+
     root_logger.info('=== OpenTTD Admin Bot Starting ===')
-    root_logger.info('Admin Ports: 3967-3976')
-    root_logger.info('Game Ports: 3979-3988')
-    
+    if servers:
+        admin_ports = [cfg.admin_port for cfg in servers]
+        game_ports = [cfg.game_port for cfg in servers if cfg.game_port]
+        root_logger.info('Admin Ports: %s-%s', min(admin_ports), max(admin_ports))
+        if game_ports:
+            root_logger.info('Game Ports: %s-%s', min(game_ports), max(game_ports))
+
     threads = []
-    for cfg in SERVERS:
-        bot = OpenTTDBot(cfg)
+    total_servers = len(servers) if servers else 1
+
+    for cfg in servers:
+        bot = OpenTTDBot(cfg, total_servers=total_servers)
         _running_bots.append(bot)
         t = threading.Thread(target=bot.start, name=f'Bot-{cfg.server_num}')
         threads.append(t)
         t.start()
-    
+
     for t in threads:
         t.join()
+
+
+if __name__ == '__main__':
+    main()
