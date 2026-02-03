@@ -7,7 +7,7 @@
 
 ## What’s inside
 
-- **Multi-server bot (up to 10 servers):** `main.py` — requires `settings.json`
+- **Server bot (1 to 10 servers):** `main.py` — requires `settings.json`
 - **Python-only stack:** built on [`pyOpenTTDAdmin`](https://pypi.org/project/pyOpenTTDAdmin/)
 
 ## Highlights
@@ -23,11 +23,11 @@
 
 ## Files & entrypoints
 
-| File | Purpose |
-| --- | --- |
-| `main.py` | Multi-server runner (reads `settings.json`; supports up to 10 servers). |
-| `settings.json` | Multi-server config: admin/game ports, credentials, scenario, thresholds. |
-| `requirements.txt` | Python dependencies (primary: `pyOpenTTDAdmin`). |
+| File                | Purpose                                                                   |
+| ----------------    | -------------------------------------                                     |
+| `main.py`           | Main entry point (reads `settings.json`; supports up to 10 servers).      |
+| `settings.json`     | Multi-server config: admin/game ports, credentials, scenario, thresholds. |
+| `requirements.txt`  | Python dependencies (primary: `pyOpenTTDAdmin`).                          |
 
 ## Requirements
 
@@ -42,14 +42,14 @@ Set values inside `main.py` or supply a `settings.json`. At minimum:
 
 ```json
 {
-  "server_ip": "127.0.0.1",
+  "server_ip": "127.0.0.1",         // openttd ip
   "admin_name": "Admin",
-  "admin_pass": "password",       // change password
-  "admin_ports": [3977],          // add more for multi-server, e.g., [3977, 3978, 3979]
-  "load_scenario": "your_map.scn",        // setup a scenario map
+  "admin_pass": "password",         // change password
+  "admin_ports": [3977],            // add more for multi-server, e.g., [3977, 3978, 3979]
+  "load_scenario": "your_map.scn",  // load a scenario map
   "goal_value": 10000000000,
-  "dead_co_age": 5,                 // years before auto-clean
-  "dead_co_value": 5000000,         // value should be more for auto-clean
+  "dead_co_age": 5,                 // years before auto-clean policy
+  "dead_co_value": 5000000,         // autoclean threshhold company value
   "rcon_retry_max": 3,
   "rcon_retry_delay": 0.5,
   "reconnect_max_attempts": 10,
@@ -77,12 +77,12 @@ See the provided `settings.json` for a working multi-server example.
 
 Command | Action
 ---|---
-`!help` | List commands
-`!info` | Server description + goal amount
-`!rules` | Basic server rules
-`!cv` | Top 10 company values + % to goal
-`!reset` | Request to delete your current company
-`!yes` | Confirm deletion (30 s timeout)
+`!help`    | List commands
+`!info`    | Server description + goal amount
+`!rules`   | Basic server rules
+`!cv`      | Top 10 company values + % to goal
+`!reset`   | Request to delete your current company
+`!yes`     | Confirm deletion (30 s timeout)
 
 ## Run locally
 
