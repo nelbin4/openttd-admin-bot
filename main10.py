@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import time
@@ -12,18 +13,20 @@ from enum import Enum
 from collections import OrderedDict
 import tracemalloc
 
+from pyopenttdadmin import Admin, openttdpacket, AdminUpdateType, AdminUpdateFrequency
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
-
+# must have settings.json besides main10.py -- rename to main.py
 @dataclass
 class Config:
     admin_port: int
     game_port: int
     server_num: int
-    server_ip = "192.168.1.10"
-    admin_name = "admin"
-    admin_pass = "PASSWORDPASSWORD"
+    server_ip = ""
+    admin_name = ""
+    admin_pass = ""
     goal_value = 100_000_000_000
     load_scenario = "flat2048prodboost.scn"
     dead_co_age = 5
@@ -34,7 +37,45 @@ class Config:
     reconnect_delay = 5.0
 
 
-SERVERS = [Config(admin_port=3967+i, game_port=3979+i, server_num=i+1) for i in range(10)]
+GAME_START_YEAR = 1950
+RESET_COUNTDOWN_SECONDS = 20
+
+
+def load_settings(path="settings.json"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        root_logger.error("settings.json not found at %s", path)
+        raise
+    except json.JSONDecodeError as e:
+        root_logger.error("settings.json is invalid JSON: %s", e)
+        raise
+
+
+def build_server_configs(settings):
+    admin_ports = settings.get("admin_ports") or []
+    game_ports = settings.get("game_ports") or []
+    if game_ports and len(game_ports) != len(admin_ports):
+        raise ValueError("game_ports length must match admin_ports when provided")
+
+    configs = []
+    for idx, admin_port in enumerate(admin_ports):
+        game_port = game_ports[idx] if game_ports else 0
+        cfg = Config(admin_port=admin_port, game_port=game_port, server_num=idx + 1)
+        cfg.server_ip = settings.get("server_ip", cfg.server_ip)
+        cfg.admin_name = settings.get("admin_name", cfg.admin_name)
+        cfg.admin_pass = settings.get("admin_pass", cfg.admin_pass)
+        cfg.goal_value = settings.get("goal_value", cfg.goal_value)
+        cfg.load_scenario = settings.get("load_scenario", cfg.load_scenario)
+        cfg.dead_co_age = settings.get("dead_co_age", cfg.dead_co_age)
+        cfg.dead_co_value = settings.get("dead_co_value", cfg.dead_co_value)
+        configs.append(cfg)
+    return configs
+
+
+SETTINGS = load_settings()
+SERVERS = build_server_configs(SETTINGS)
 
 CACHE_TTL = 30.0
 CACHE_MAX_SIZE = 500
@@ -351,7 +392,6 @@ class RconHandler:
 
 class SafeAdmin:
     def __init__(self, *args, **kwargs):
-        from pyopenttdadmin import Admin
         self._admin = Admin(*args, **kwargs)
         self._send_lock = threading.Lock()
         self.connected = False
@@ -424,7 +464,6 @@ class RulesCommand(CommandHandler):
 
 class CompanyValueCommand(CommandHandler):
     def execute(self, cid, args, state):
-        self.bot._batch_refresh_state(reason="cmd_cv")
         state = self.bot._refresh_game_state()
         companies = state.get('companies', {})
         clients = state.get('clients', {})
@@ -452,8 +491,6 @@ class ResetCommand(CommandHandler):
                 self.bot.send_msg("Reset already pending. Type !yes to confirm or wait for timeout.", cid)
                 return
         
-        self.bot._batch_refresh_state(reason="cmd_reset")
-        
         co_id = self.bot._get_client_company(cid)
         if co_id is None or co_id == Constants.SPECTATOR_ID.value:
             self.bot.send_msg("Must be in company to reset", cid)
@@ -478,8 +515,6 @@ class ResetCommand(CommandHandler):
 
 class YesCommand(CommandHandler):
     def execute(self, cid, args, state):
-        self.bot._batch_refresh_state(reason="cmd_yes")
-        
         with self.bot.reset_lock:
             if cid not in self.bot.reset_pending:
                 self.bot.send_msg("No pending reset. Use !reset first", cid)
@@ -556,6 +591,8 @@ class OpenTTDBot:
         self.reset_lock = threading.Lock()
         self.reset_pending = {}
         self.reset_timers = {}
+
+        self.paused_lock = threading.Lock()
         
         self.cleanup_lock = threading.Lock()
         self.cleanup_in_progress = set()
@@ -588,16 +625,15 @@ class OpenTTDBot:
     def _validate_config(self):
         if not (1024 <= self.cfg.admin_port <= 65535):
             raise ValueError(f"Invalid admin_port: {self.cfg.admin_port}")
-        if not (1024 <= self.cfg.game_port <= 65535):
-            raise ValueError(f"Invalid game_port: {self.cfg.game_port}")
+        if self.cfg.game_port:
+            if not (1024 <= self.cfg.game_port <= 65535):
+                raise ValueError(f"Invalid game_port: {self.cfg.game_port}")
         if self.cfg.goal_value <= 0:
             raise ValueError(f"Invalid goal_value: {self.cfg.goal_value}")
         if not self.cfg.load_scenario:
             raise ValueError("load_scenario cannot be empty")
     
     def start(self):
-        from pyopenttdadmin import openttdpacket, AdminUpdateType, AdminUpdateFrequency
-        
         self.admin.add_handler(openttdpacket.ChatPacket)(self.on_chat)
         self.admin.add_handler(openttdpacket.ClientJoinPacket)(self.on_join)
         self.admin.add_handler(openttdpacket.ClientInfoPacket)(self.on_client_info)
@@ -630,13 +666,19 @@ class OpenTTDBot:
                     self._cleanup_unnamed_company()
                     self._monitor_tick()
                     
-                    threading.Thread(target=self._game_monitor_loop, daemon=True, name="GameMonitor").start()
-                    threading.Thread(target=self._company_refresh_loop, daemon=True, name="CompanyRefresh").start()
-                    threading.Thread(target=self._periodic_cleanup_loop, daemon=True, name="PeriodicCleanup").start()
-                    threading.Thread(target=self._memory_monitor_loop, daemon=True, name="MemoryMonitor").start()
-                    threading.Thread(target=self._cache_cleanup_loop, daemon=True, name="CacheCleanup").start()
+                    for target, name in [
+                        (self._game_monitor_loop, "GameMonitor"),
+                        (self._company_refresh_loop, "CompanyRefresh"),
+                        (self._periodic_cleanup_loop, "PeriodicCleanup"),
+                        (self._memory_monitor_loop, "MemoryMonitor"),
+                        (self._cache_cleanup_loop, "CacheCleanup"),
+                    ]:
+                        try:
+                            threading.Thread(target=target, daemon=True, name=name).start()
+                        except Exception as e:
+                            self.logger.error("Failed to start thread %s: %s", name, e)
                     
-                    self.broadcast("Admin connected")
+                    self.send_msg("Admin connected")
                     self.logger.info("Main loop start")
                     
                     while not self.stop_event.is_set():
@@ -808,7 +850,7 @@ class OpenTTDBot:
         
         cached = self.clients_cache.get(cid) or {}
         self.clients_cache.set(cid, {
-            'name': pkt.name,
+            'name': cached.get('name', pkt.name),
             'company': co_id
         })
         self.cache_ts = time.time()
@@ -924,7 +966,8 @@ class OpenTTDBot:
                     'value': int(value.replace(',', '')),
                 })
                 updated += 1
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError) as e:
+                self.logger.debug("Company parse failed: %s (line=%s)", e, line)
                 continue
         
         if updated:
@@ -937,7 +980,7 @@ class OpenTTDBot:
     def _parse_clients(self, output):
         if not output.strip():
             return
-        
+
         for line in output.splitlines():
             m = CLIENT_RE.match(line)
             if not m:
@@ -945,14 +988,16 @@ class OpenTTDBot:
             try:
                 parsed_cid, parsed_name, parsed_co = m.groups()
                 cid = int(parsed_cid)
-                company_id = int(parsed_co) if parsed_co != str(Constants.SPECTATOR_ID.value) else Constants.SPECTATOR_ID.value
-                
+                parsed_co_int = int(parsed_co)
+                company_id = parsed_co_int if parsed_co_int != Constants.SPECTATOR_ID.value else Constants.SPECTATOR_ID.value
+
                 existing = self.clients_cache.get(cid) or {}
                 self.clients_cache.set(cid, {
                     'name': existing.get('name', parsed_name),
                     'company': company_id
                 })
-            except (ValueError, AttributeError):
+            except (ValueError, AttributeError) as e:
+                self.logger.debug("Client parse failed: %s (line=%s)", e, line)
                 continue
         
         self.last_clients_rcon = time.time()
@@ -965,21 +1010,30 @@ class OpenTTDBot:
                 year_str = m.group(1)
                 try:
                     parsed = datetime.datetime.strptime(year_str, "%Y-%m-%d").date()
-                    return float(parsed.year)
+                    return int(parsed.year)
                 except ValueError:
-                    return float(year_str.split('-')[0])
+                    return int(year_str.split('-')[0])
         if companies:
-            max_year = max((co.get("start_date", 0) for co in companies.values()), default=1950)
-            return float(max_year)
-        return 1950.0
+            max_year = max((co.get("start_date", 0) for co in companies.values()), default=GAME_START_YEAR)
+            return int(max_year)
+        return GAME_START_YEAR
     
     def _update_companies_from_rcon(self, reason=""):
         output = self.rcon.execute('companies')
         self._parse_companies(output, reason)
+
+    def _update_clients_from_rcon(self, reason=""):
+        output = self.rcon.execute('clients')
+        if output:
+            self._parse_clients(output)
+            if reason:
+                self.logger.info("Clients refreshed: %s", reason)
     
     def _company_refresh_loop(self):
         while not self.stop_event.wait(60):
-            if self.paused is True:
+            with self.paused_lock:
+                is_paused = self.paused is True
+            if is_paused:
                 continue
             with self.phase_lock:
                 phase = self.phase
@@ -989,33 +1043,28 @@ class OpenTTDBot:
     
     def _cleanup_unnamed_company(self):
         try:
-            out = self.rcon.execute('companies')
-            if out.strip():
-                for line in out.splitlines():
-                    m = COMPANY_RE.match(line)
-                    if not m:
-                        continue
-                    try:
-                        parsed_id, parsed_name, *_ = m.groups()
-                        co_id = int(parsed_id)
-                        co_name = parsed_name.strip()
-                        if co_name.lower() == Constants.UNNAMED_COMPANY.value:
+            self._update_companies_from_rcon(reason="unnamed_check")
+            for co_id, co_data in list(self.companies_cache.items()):
+                try:
+                    co_name = (co_data.get('name') or '').strip().lower()
+                    if co_name == Constants.UNNAMED_COMPANY.value:
+                        with self.cleanup_lock:
+                            if co_id in self.cleanup_in_progress:
+                                return False
+                            self.cleanup_in_progress.add(co_id)
+
+                        try:
+                            self.logger.info("Deleting unnamed company: id=%s", co_id)
+                            self.rcon.execute(f"reset_company {co_id}", escape_args=False)
+                            time.sleep(0.1)
+                            self.companies_cache.delete(co_id)
+                            return True
+                        finally:
                             with self.cleanup_lock:
-                                if co_id in self.cleanup_in_progress:
-                                    return False
-                                self.cleanup_in_progress.add(co_id)
-                            
-                            try:
-                                self.logger.info("Deleting unnamed company: id=%s", co_id)
-                                self.rcon.execute(f"reset_company {co_id}", escape_args=False)
-                                time.sleep(0.1)
-                                self.companies_cache.delete(co_id)
-                                return True
-                            finally:
-                                with self.cleanup_lock:
-                                    self.cleanup_in_progress.discard(co_id)
-                    except (ValueError, AttributeError):
-                        continue
+                                self.cleanup_in_progress.discard(co_id)
+                except Exception as e:
+                    self.logger.debug("Unnamed cleanup parse failed for co=%s: %s", co_id, e)
+                    continue
             return False
         except Exception:
             self.logger.exception("Unnamed company cleanup failed")
@@ -1042,7 +1091,8 @@ class OpenTTDBot:
             return
         
         active_companies = self._get_active_companies(companies, clients)
-        should_pause = len(active_companies) == 0
+        with self.paused_lock:
+            should_pause = len(active_companies) == 0
         
         needs_unpause = False
         with self.pause_timer_lock:
@@ -1054,21 +1104,27 @@ class OpenTTDBot:
                 if self.pause_timer:
                     self.pause_timer.cancel()
                     self.pause_timer = None
-                if self.paused is not False:
+                with self.paused_lock:
+                    currently_paused = self.paused
+                if currently_paused is not False:
                     needs_unpause = True
         
         if needs_unpause:
             self.rcon.execute('unpause')
-            self.paused = False
+            with self.paused_lock:
+                self.paused = False
             self.logger.info("Game unpaused: %d active companies", len(active_companies))
     
     def _do_pause(self):
         with self.pause_timer_lock:
             self.pause_timer = None
         
-        if not self.paused:
+        with self.paused_lock:
+            already_paused = self.paused
+        if not already_paused:
             self.rcon.execute('pause')
-            self.paused = True
+            with self.paused_lock:
+                self.paused = True
             self.logger.info("Game paused: no active companies")
     
     def _transition_phase(self, new_phase):
@@ -1101,7 +1157,6 @@ class OpenTTDBot:
         return True
     
     def send_msg(self, msg, cid=None):
-        from pyopenttdadmin import openttdpacket
         for line in msg.split('\n'):
             try:
                 if cid:
@@ -1114,9 +1169,6 @@ class OpenTTDBot:
                 self.logger.error("Send failed: %s", e)
             time.sleep(MSG_RATE_LIMIT)
     
-    def broadcast(self, msg):
-        self.send_msg(msg)
-    
     def _game_monitor_loop(self):
         self.logger.info("Monitor loop start")
         while not self.stop_event.is_set():
@@ -1126,7 +1178,7 @@ class OpenTTDBot:
     
     def _monitor_tick(self):
         try:
-            self._batch_refresh_state(reason="monitor_tick")
+            self._refresh_game_state()
             self._cleanup_unnamed_company()
             
             state = self._refresh_game_state()
@@ -1159,10 +1211,11 @@ class OpenTTDBot:
             with self.phase_lock:
                 if self.phase in (GamePhase.GOAL_REACHED, GamePhase.RESETTING):
                     return MONITOR_INTERVAL_DEFAULT
-                
+
                 self.logger.info("GOAL! %s=$%s", top['name'], self._fmt(top['value']))
-                if self._transition_phase(GamePhase.GOAL_REACHED):
-                    self._handle_goal(top['name'], top['value'])
+                transitioned = self._transition_phase(GamePhase.GOAL_REACHED)
+            if transitioned:
+                self._handle_goal(top['name'], top['value'])
             return MONITOR_INTERVAL_DEFAULT
         
         if ratio >= 0.95:
@@ -1181,7 +1234,7 @@ class OpenTTDBot:
         
         for co_id, co_data in companies.items():
             founded = co_data.get('start_date')
-            if not founded or founded <= 1950:
+            if not founded or founded <= GAME_START_YEAR:
                 continue
             
             age = year - founded
@@ -1192,7 +1245,7 @@ class OpenTTDBot:
         
         futures = []
         for co_id, co_data in dead_companies:
-            future = self.executor.submit(self._cleanup_company, co_id, co_data, clients)
+            future = self.executor.submit(self._cleanup_company, co_id, co_data)
             futures.append(future)
         
         for future in futures:
@@ -1201,7 +1254,7 @@ class OpenTTDBot:
             except Exception as e:
                 self.logger.error("Cleanup future failed: %s", e)
     
-    def _cleanup_company(self, co_id, co_data, clients):
+    def _cleanup_company(self, co_id, co_data):
         with self.cleanup_lock:
             if co_id in self.cleanup_in_progress:
                 self.logger.debug("Cleanup already in progress for co=%d", co_id)
@@ -1216,8 +1269,9 @@ class OpenTTDBot:
                 return
             
             try:
+                self._update_clients_from_rcon(reason="cleanup_company")
                 name = co_data.get('name', f"Co {co_id}")
-                co_clients = [c for c, d in clients.items() if d.get('company') == co_id]
+                co_clients = [c for c, d in self.clients_cache.items() if d.get('company') == co_id]
                 
                 self.logger.info("Cleanup: co=%d n=%s cl=%d", co_id, name, len(co_clients))
                 
@@ -1227,7 +1281,7 @@ class OpenTTDBot:
                 
                 self.rcon.execute(f"reset_company {co_id}", escape_args=False)
                 self.companies_cache.delete(co_id)
-                self.broadcast(f"Dead company cleanup: {name}")
+                self.send_msg(f"Dead company cleanup: {name}")
                 self.logger.info("Cleanup done: co=%d", co_id)
             finally:
                 self.cleanup_semaphore.release()
@@ -1238,38 +1292,40 @@ class OpenTTDBot:
     def _handle_goal(self, winner, value):
         try:
             with self.phase_lock:
-                if not self._transition_phase(GamePhase.RESETTING):
+                if self.phase != GamePhase.GOAL_REACHED:
                     return
-            
+                self._transition_phase(GamePhase.RESETTING)
+
             msg = (
                 "=== GOAL ACHIEVED ===\n"
                 f"Winner: {winner}\n"
                 f"Goal: ${self._fmt(self.cfg.goal_value)}\n"
-                "Map restart in 20s..."
+                f"Map restart in {RESET_COUNTDOWN_SECONDS}s..."
             )
-            self.broadcast(msg)
+            self.send_msg(msg)
             threading.Thread(target=self._reset_countdown, daemon=True).start()
         except Exception:
             self.logger.exception("Goal handler failed")
     
     def _reset_countdown(self):
         try:
-            self.logger.info("Reset countdown: 20s")
-            for i in range(20, 0, -1):
+            self.logger.info("Reset countdown: %ds", RESET_COUNTDOWN_SECONDS)
+            for i in range(RESET_COUNTDOWN_SECONDS, 0, -1):
                 if i in (10, 5):
-                    self.broadcast(f"Map reset in {i}s...")
+                    self.send_msg(f"Map reset in {i}s...")
                 if self.stop_event.wait(1):
                     self.logger.info("Reset countdown aborted")
                     return
             
             if self._load_scenario():
-                self.broadcast("New map loaded")
+                self.send_msg("New map loaded")
                 with self.phase_lock:
                     self._transition_phase(GamePhase.WAITING)
-                self.paused = False
+                with self.paused_lock:
+                    self.paused = False
                 self._schedule_pause_check()
             else:
-                self.broadcast("Map reset failed!")
+                self.send_msg("Map reset failed!")
                 with self.phase_lock:
                     self._transition_phase(GamePhase.ACTIVE)
         except Exception:
@@ -1279,47 +1335,26 @@ class OpenTTDBot:
         cached = self.clients_cache.get(cid)
         if cached and cached.get('name'):
             return cached['name']
-        
-        out = self.rcon.execute('clients')
-        if out.strip():
-            for line in out.splitlines():
-                m = CLIENT_RE.match(line)
-                if not m:
-                    continue
-                try:
-                    parsed_cid, parsed_name, co = m.groups()
-                    if int(parsed_cid) == cid:
-                        existing = self.clients_cache.get(cid) or {}
-                        existing['name'] = parsed_name
-                        self.clients_cache.set(cid, existing)
-                        return parsed_name
-                except (ValueError, AttributeError):
-                    continue
-        
+
+        self._update_clients_from_rcon(reason="name_lookup")
+
+        cached = self.clients_cache.get(cid)
+        if cached and cached.get('name'):
+            return cached['name']
+
         return f"C{cid}"
     
     def _get_client_company(self, cid):
         cached = self.clients_cache.get(cid)
         if cached and 'company' in cached:
             return cached['company']
-        
-        out = self.rcon.execute('clients')
-        if out.strip():
-            for line in out.splitlines():
-                m = CLIENT_RE.match(line)
-                if not m:
-                    continue
-                try:
-                    parsed_cid, parsed_name, parsed_co = m.groups()
-                    if int(parsed_cid) == cid:
-                        company_id = int(parsed_co) if parsed_co != str(Constants.SPECTATOR_ID.value) else Constants.SPECTATOR_ID.value
-                        existing = self.clients_cache.get(cid) or {}
-                        existing['company'] = company_id
-                        self.clients_cache.set(cid, existing)
-                        return company_id
-                except (ValueError, AttributeError):
-                    continue
-        
+
+        self._update_clients_from_rcon(reason="company_lookup")
+
+        cached = self.clients_cache.get(cid)
+        if cached and 'company' in cached:
+            return cached['company']
+
         return None
     
     def _greet(self, cid):
@@ -1352,8 +1387,8 @@ class OpenTTDBot:
         with self.reset_lock:
             self.reset_pending.pop(cid, None)
             timer = self.reset_timers.pop(cid, None)
-        if timer:
-            timer.cancel()
+            if timer:
+                timer.cancel()
     
     def _fmt(self, val):
         if val >= 1_000_000_000:
