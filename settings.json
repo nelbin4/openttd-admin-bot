@@ -1,0 +1,11 @@
+{
+  "server_ip": "192.168.1.10",
+  "admin_name": "admin",
+  "admin_pass": "PASSWORDPASSWORD",
+  "admin_ports": [3967, 3968, 3969, 3970, 3971, 3972, 3973, 3974, 3975, 3976],
+  "game_ports": [3979, 3980, 3981, 3982, 3983, 3984, 3985, 3986, 3987, 3988],
+  "load_scenario": "flat2048prodboost.scn",
+  "goal_value": 100000000000,
+  "dead_co_age": 5,
+  "dead_co_value": 5000000
+}
