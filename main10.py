@@ -1,3 +1,4 @@
+# this is for 10 servers to admin. rename main10.py to main.py and include settings.json(adjust settings there)
 import json
 import logging
 import re
@@ -18,7 +19,6 @@ from pyopenttdadmin import Admin, openttdpacket, AdminUpdateType, AdminUpdateFre
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
-# must have settings.json besides main10.py -- rename to main.py
 @dataclass
 class Config:
     admin_port: int
