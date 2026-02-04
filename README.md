@@ -13,10 +13,9 @@
 ## Highlights
 
 - **Auto pause/unpause** when the map is empty; instant unpause on first active company.
-- **Goal tracking**: watches top company value vs. configured goal; faster polling at 90%/95%; announces winner → countdown → loads new scenario.
-- **Dead company cleanup**: resets aged/low-value companies and moves players to spectators first.
-- **Player self-service**: `!reset` + `!yes` with safety checks for company changes/quit.
-- **Scenario reset flow**: winner announcement → timed reset countdown → scenario reload → state cleanup.
+- **Goal tracking**: watches top company value, announces winner → countdown → loads new scenario.
+- **Dead company cleanup**: resets aged/low-value companies.
+- **Player self-service**: `!reset` + `!yes` for company reset request.
 - **Startup hygiene**: removes default “Unnamed” company; greets joiners.
 - **RCON safety**: serialized calls, retries, circuit breaker, buffered responses.
 - **Caching & speed**: TTL-based company/client caches with periodic refresh and backoff.
