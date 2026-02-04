@@ -124,8 +124,9 @@ CLEANUP_SEMAPHORE_MAX = 3
 
 COMPANY_RE = re.compile(
     r"#\s*:?(\d+)(?:\([^)]+\))?\s+Company Name:\s*'([^']*)'\s+"
-    r"Year Founded:\s*(\d+)\s+Money:\s*\$?([-0-9,]+)\s+"
-    r"Loan:\s*\$?(\d+,?\d*)\s+Value:\s*\$?(\d+,?\d*)", re.I
+    r"Year Founded:\s*(\d+)\s+Money:\s*[^0-9.,-]?\s*([-0-9,]+)\s+"
+    r"Loan:\s*[^0-9.,-]?\s*(\d+,?\d*)\s+Value:\s*[^0-9.,-]?\s*(\d+,?\d*)",
+    re.I,
 )
 CLIENT_RE = re.compile(r"Client #(\d+)\s+name:\s*'([^']*)'\s+company:\s*(\d+)", re.I)
 GETDATE_RE = re.compile(r"Date:\s*(\d{4}-\d{2}-\d{2})")
@@ -984,9 +985,16 @@ class OpenTTDBot:
             return
         
         updated = 0
+        unmatched = 0
+
+        def _to_int(num_str):
+            cleaned = re.sub(r"[^0-9-]", "", num_str)
+            return int(cleaned) if cleaned not in ("", "-") else 0
+
         for line in output.splitlines():
             m = COMPANY_RE.match(line)
             if not m:
+                unmatched += 1
                 continue
             try:
                 parsed_id, parsed_name, year, money, loan, value = m.groups()
@@ -995,9 +1003,9 @@ class OpenTTDBot:
                     'display_id': co_id,
                     'name': parsed_name.strip(),
                     'start_date': int(year),
-                    'money': int(money.replace(',', '')),
-                    'loan': int(loan.replace(',', '')),
-                    'value': int(value.replace(',', '')),
+                    'money': _to_int(money),
+                    'loan': _to_int(loan),
+                    'value': _to_int(value),
                 })
                 updated += 1
             except (ValueError, AttributeError) as e:
@@ -1010,6 +1018,12 @@ class OpenTTDBot:
             self.last_companies_rcon = time.time()
             if reason:
                 self.logger.info("Companies refreshed: %s (updated=%d)", reason, updated)
+        elif output.strip():
+            self.logger.warning(
+                "Companies parse produced zero entries (reason=%s, unmatched=%d)",
+                reason or "n/a",
+                unmatched,
+            )
     
     def _parse_clients(self, output):
         if not output.strip():
@@ -1053,6 +1067,17 @@ class OpenTTDBot:
         return 1950
     
     def _update_companies_from_rcon(self, reason=""):
+        now = time.time()
+        age = now - self.last_companies_rcon
+        if age < RCON_REFRESH_TTL:
+            self.logger.debug(
+                "Skip RCON companies refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
+                age,
+                RCON_REFRESH_TTL,
+                reason or "n/a",
+            )
+            return
+
         if reason:
             self.logger.debug("Using RCON fallback for companies (reason=%s)", reason)
         output = self.rcon.execute('companies')
