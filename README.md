@@ -38,7 +38,7 @@
 ## Configuration
 
 ### Configuration (main.py)
-Set values inside `main.py` or supply a `settings.json`. At minimum:
+Set values inside `settings.json`. `main.py` reads with arrays of ports. Up to **10 servers** are started—one per `admin_port` entry.
 
 ```json
 {
@@ -58,21 +58,6 @@ Set values inside `main.py` or supply a `settings.json`. At minimum:
 }
 ```
 
-`main.py` reads **settings.json** with arrays of ports. Up to **10 servers** are started—one per `admin_port` entry.
-
-Required keys in `settings.json`:
-
-- `server_ip`
-- `admin_name`, `admin_pass`
-- `admin_ports` (list, up to 10)
-- `load_scenario`, `goal_value`
-- `dead_co_age`, `dead_co_value`
-- `rcon_retry_max`, `rcon_retry_delay`
-- `reconnect_max_attempts`, `reconnect_delay`
-- `reset_countdown_seconds`
-
-See the provided `settings.json` for a working multi-server example.
-
 ## Chat commands
 
 Command | Action
@@ -82,7 +67,7 @@ Command | Action
 `!rules`   | Basic server rules
 `!cv`      | Top 10 company values + % to goal
 `!reset`   | Request to delete your current company
-`!yes`     | Confirm deletion (30 s timeout)
+`!yes`     | Confirm deletion (30s timeout), used when !reset
 
 ## Run locally
 
@@ -125,8 +110,9 @@ For single server inside Docker, change the CMD to `main.py`.
 
 - `load_scenario` must exist on the OpenTTD host.
 - Use a **strong admin password**—possession grants full control.
-- The bot trims unnamed companies and pauses idle maps to save CPU.
-- Goal handling: winner announcement → reset countdown → scenario reload → state reset.
+- At startup, bot trims "Unnamed" company and pauses idle map. Auto unpause when company is created.
+- "Unnamed" company is generated when scenario map is used on a multiplayer game.
+- Goal handling: winner announcement → start reset countdown (default: 20s) → scenario load → state reset.
 
 ## License
 
