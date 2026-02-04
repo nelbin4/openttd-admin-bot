@@ -16,6 +16,7 @@
 - **Goal tracking**: watches top company value vs. configured goal; faster polling at 90%/95%; announces winner → countdown → loads new scenario.
 - **Dead company cleanup**: resets aged/low-value companies and moves players to spectators first.
 - **Player self-service**: `!reset` + `!yes` with safety checks for company changes/quit.
+- **Scenario reset flow**: winner announcement → timed reset countdown → scenario reload → state cleanup.
 - **Startup hygiene**: removes default “Unnamed” company; greets joiners.
 - **RCON safety**: serialized calls, retries, circuit breaker, buffered responses.
 - **Caching & speed**: TTL-based company/client caches with periodic refresh and backoff.
@@ -26,7 +27,7 @@
 | File                | Purpose                                                                   |
 | ----------------    | -------------------------------------                                     |
 | `main.py`           | Main entry point (reads `settings.json`; supports many servers; practical limit depends on hardware). |
-| `settings.json`     | Multi-server config: admin/game ports, credentials, scenario, thresholds. |
+| `settings.json`     | Multi-server config: admin ports (optional game_ports must match length), credentials, scenario, thresholds. |
 | `requirements.txt`  | Python dependencies (primary: `pyOpenTTDAdmin`).                          |
 
 ## Requirements
@@ -84,6 +85,8 @@ pip install -r requirements.txt
 python main.py
 ```
 
+> Note: `main.py` adjusts `sys.path` so the bundled `pyOpenTTDAdmin` is importable without a virtualenv. A venv is still recommended for dependency isolation, but not required for imports.
+
 ## Docker (production-friendly)
 
 ```dockerfile
@@ -92,7 +95,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "main10.py"]
+CMD ["python", "main.py"]
 ```
 
 ```bash
