@@ -408,7 +408,7 @@ class RconHandler:
             if self.inflight:
                 self.end_ts = time.time()
                 self.inflight = False
-                self.logger.debug("RCON end received for cmd=%s", self.current_cmd)
+                self.logger.debug("[Rcon] end received for cmd=%s", self.current_cmd)
                 self.cv.notify_all()
     
     def batch_execute(self, commands):
@@ -436,17 +436,17 @@ class SafeAdmin:
         try:
             self._admin.login(admin_name, admin_pass)
             self.connected = True
-            logger.info("Connected successfully")
+            logger.info("[Packet] Connected successfully")
             return True
         except Exception as e:
-            logger.error("Connection failed: %s", e)
+            logger.error("[Packet] Connection failed: %s", e)
             self.connected = False
             return False
     
     def ensure_connected(self, admin_name, admin_pass, logger):
         with self.reconnect_lock:
             if not self.connected:
-                logger.info("Attempting reconnect...")
+                logger.info("[Packet] Attempting reconnect...")
                 return self.connect(admin_name, admin_pass, logger)
             return True
 
@@ -492,6 +492,11 @@ class RulesCommand(CommandHandler):
 
 class CompanyValueCommand(CommandHandler):
     def execute(self, cid, args, state):
+        # Prefer packet cache; fallback to RCON when stale/empty
+        if not self.bot._cache_valid():
+            self.bot._update_companies_from_rcon(reason="cv_command", force=True)
+            self.bot._update_clients_from_rcon(reason="cv_command", force=True)
+
         state = self.bot._refresh_game_state()
         companies = state.get('companies', {})
         clients = state.get('clients', {})
@@ -593,6 +598,7 @@ class YesCommand(CommandHandler):
 class OpenTTDBot:
     def __init__(self, cfg, total_servers=1):
         self.cfg = cfg
+        self.total_servers = total_servers
         self.logger = logging.getLogger(f"[S{self.cfg.server_num}]")
         self._validate_config()
         
@@ -844,12 +850,12 @@ class OpenTTDBot:
         if msg.startswith('!'):
             if not self._check_command_cooldown(cid):
                 return
-            self.logger.info("CMD: c=%s msg=%s", cid, msg)
+            self.logger.info("[Packet] CMD: c=%s msg=%s", cid, msg)
             self.executor.submit(self._process_cmd, cid, msg)
     
     def on_join(self, admin, pkt):
         cid = pkt.id
-        self.logger.info("Join: c=%s", cid)
+        self.logger.info("[Packet] Join: c=%s", cid)
         self.executor.submit(self._cleanup_unnamed_company)
         self.executor.submit(self._greet, cid)
     
@@ -899,7 +905,7 @@ class OpenTTDBot:
         self._schedule_pause_check()
     
     def on_new_game(self, admin, pkt):
-        self.logger.info("New game/map detected")
+        self.logger.info("[Packet] New game/map detected")
         time.sleep(0.5)
         self.companies_cache.clear()
         self.cache_ts = 0.0
@@ -936,8 +942,15 @@ class OpenTTDBot:
         return time.time() - self.cache_ts < CACHE_TTL
     
     def _refresh_game_state(self):
-        need_refresh = not self._cache_valid()
         now = time.time()
+        companies = {k: v for k, v in self.companies_cache.items()}
+        clients = {k: v for k, v in self.clients_cache.items()}
+
+        # If packet-driven cache is fresh, skip RCON
+        if self._cache_valid():
+            return {'companies': companies, 'clients': clients}
+        
+        need_refresh = False
         
         if (now - self.last_companies_rcon >= RCON_REFRESH_TTL) or \
            (now - self.last_clients_rcon >= RCON_REFRESH_TTL):
@@ -945,9 +958,8 @@ class OpenTTDBot:
         
         if need_refresh:
             self._batch_refresh_state(reason="cache_refresh")
-        
-        companies = {k: v for k, v in self.companies_cache.items()}
-        clients = {k: v for k, v in self.clients_cache.items()}
+            companies = {k: v for k, v in self.companies_cache.items()}
+            clients = {k: v for k, v in self.clients_cache.items()}
         
         if not companies:
             has_client_company = any(
@@ -972,7 +984,7 @@ class OpenTTDBot:
         if not commands:
             return
         
-        self.logger.debug("Using RCON fallback for %s (reason=%s)", ','.join(commands), reason or 'cache_refresh')
+        self.logger.debug("[Rcon] Using fallback for %s (reason=%s)", ','.join(commands), reason or 'cache_refresh')
         results = self.rcon.batch_execute(commands)
         
         if 'companies' in results:
@@ -1066,12 +1078,15 @@ class OpenTTDBot:
             return int(max_year)
         return 1950
     
-    def _update_companies_from_rcon(self, reason=""):
+    def _update_companies_from_rcon(self, reason="", force=False):
         now = time.time()
         age = now - self.last_companies_rcon
-        if age < RCON_REFRESH_TTL:
+        has_data = any(True for _ in self.companies_cache.items())
+
+        should_refresh = force or (not has_data) or (age >= RCON_REFRESH_TTL)
+        if not should_refresh:
             self.logger.debug(
-                "Skip RCON companies refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
+                "[Rcon] Skip companies refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
                 age,
                 RCON_REFRESH_TTL,
                 reason or "n/a",
@@ -1079,13 +1094,27 @@ class OpenTTDBot:
             return
 
         if reason:
-            self.logger.debug("Using RCON fallback for companies (reason=%s)", reason)
+            self.logger.debug("[Rcon] Using fallback for companies (reason=%s, force=%s)", reason, force)
         output = self.rcon.execute('companies')
         self._parse_companies(output, reason)
 
-    def _update_clients_from_rcon(self, reason=""):
+    def _update_clients_from_rcon(self, reason="", force=False):
+        now = time.time()
+        age = now - self.last_clients_rcon
+        has_data = any(True for _ in self.clients_cache.items())
+
+        should_refresh = force or (not has_data) or (age >= RCON_REFRESH_TTL)
+        if not should_refresh:
+            self.logger.debug(
+                "[Rcon] Skip clients refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
+                age,
+                RCON_REFRESH_TTL,
+                reason or "n/a",
+            )
+            return
+
         if reason:
-            self.logger.debug("Using RCON fallback for clients (reason=%s)", reason)
+            self.logger.debug("[Rcon] Using fallback for clients (reason=%s, force=%s)", reason, force)
         output = self.rcon.execute('clients')
         if output:
             self._parse_clients(output)
@@ -1254,9 +1283,30 @@ class OpenTTDBot:
     def _check_goal(self, companies):
         if not companies:
             return MONITOR_INTERVAL_NO_CO
-        
+
+        # Freshness tiers based on proximity to goal
+        now = time.time()
+        age = now - self.cache_ts if self.cache_ts else float('inf')
+
+        def _force_refresh_if_stale(ratio):
+            # 90%+ weekly (7d), 80%+ monthly (30d), 70%+ quarterly (90d)
+            if ratio >= 0.90 and age > 7 * 24 * 3600:
+                self._update_companies_from_rcon(reason="goal_check_90_pct", force=True)
+            elif ratio >= 0.80 and age > 30 * 24 * 3600:
+                self._update_companies_from_rcon(reason="goal_check_80_pct", force=True)
+            elif ratio >= 0.70 and age > 90 * 24 * 3600:
+                self._update_companies_from_rcon(reason="goal_check_70_pct", force=True)
+
         top_id, top = max(companies.items(), key=lambda x: x[1]['value'])
         ratio = top['value'] / self.cfg.goal_value
+        _force_refresh_if_stale(ratio)
+
+        # Recompute after potential refresh
+        if ratio >= 0.70:  # only re-evaluate when we might have refreshed
+            companies = {k: v for k, v in self.companies_cache.items()}
+            if companies:
+                top_id, top = max(companies.items(), key=lambda x: x[1]['value'])
+                ratio = top['value'] / self.cfg.goal_value
         
         if top['value'] >= self.cfg.goal_value:
             with self.phase_lock:
