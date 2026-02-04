@@ -7,7 +7,7 @@
 
 ## What’s inside
 
-- **Server bot (1 to 10 servers):** `main.py` — requires `settings.json`
+- **Server bot (1 to many servers):** `main.py` — requires `settings.json`; practical limit depends on hardware/network capacity
 - **Python-only stack:** built on [`pyOpenTTDAdmin`](https://pypi.org/project/pyOpenTTDAdmin/)
 
 ## Highlights
@@ -25,7 +25,7 @@
 
 | File                | Purpose                                                                   |
 | ----------------    | -------------------------------------                                     |
-| `main.py`           | Main entry point (reads `settings.json`; supports up to 10 servers).      |
+| `main.py`           | Main entry point (reads `settings.json`; supports many servers; practical limit depends on hardware). |
 | `settings.json`     | Multi-server config: admin/game ports, credentials, scenario, thresholds. |
 | `requirements.txt`  | Python dependencies (primary: `pyOpenTTDAdmin`).                          |
 
@@ -38,7 +38,7 @@
 ## Configuration
 
 ### Configuration (main.py)
-Set values inside `settings.json`. `main.py` reads with arrays of ports. Up to **10 servers** are started—one per `admin_port` entry.
+Set values inside `settings.json`. `main.py` reads arrays of ports and will start one bot per `admin_port` entry. Typical setups run 1–10 servers; higher counts depend on your hardware/network headroom.
 
 ```json
 {
