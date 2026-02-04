@@ -15,7 +15,7 @@ import tracemalloc
 
 from pyopenttdadmin import Admin, openttdpacket, AdminUpdateType, AdminUpdateFrequency
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
 
@@ -668,6 +668,7 @@ class OpenTTDBot:
         self.admin.add_handler(openttdpacket.ClientQuitPacket)(self.on_client_quit)
         self.admin.add_handler(openttdpacket.RconPacket)(self.on_rcon)
         self.admin.add_handler(openttdpacket.RconEndPacket)(self.on_rcon_end)
+        self.admin.add_handler(openttdpacket.ErrorPacket)(self.on_error)
         self.admin.add_handler(openttdpacket.NewGamePacket)(self.on_new_game)
         
         try:
@@ -913,6 +914,12 @@ class OpenTTDBot:
         if self.rcon:
             self.rcon.on_rcon_end()
     
+    def on_error(self, admin, pkt):
+        current_cmd = None
+        if self.rcon:
+            current_cmd = self.rcon.current_cmd
+        self.logger.warning("Server ErrorPacket: %s (current_cmd=%s)", getattr(pkt, 'error', pkt), current_cmd)
+    
     def _schedule_pause_check(self):
         with self.pause_check_lock:
             if not self.pause_check_scheduled:
@@ -964,6 +971,7 @@ class OpenTTDBot:
         if not commands:
             return
         
+        self.logger.debug("Using RCON fallback for %s (reason=%s)", ','.join(commands), reason or 'cache_refresh')
         results = self.rcon.batch_execute(commands)
         
         if 'companies' in results:
@@ -1045,10 +1053,14 @@ class OpenTTDBot:
         return 1950
     
     def _update_companies_from_rcon(self, reason=""):
+        if reason:
+            self.logger.debug("Using RCON fallback for companies (reason=%s)", reason)
         output = self.rcon.execute('companies')
         self._parse_companies(output, reason)
 
     def _update_clients_from_rcon(self, reason=""):
+        if reason:
+            self.logger.debug("Using RCON fallback for clients (reason=%s)", reason)
         output = self.rcon.execute('clients')
         if output:
             self._parse_clients(output)
