@@ -122,6 +122,9 @@ MEMORY_CHECK_INTERVAL = 600
 EXECUTOR_SHUTDOWN_TIMEOUT = 10.0
 CLEANUP_SEMAPHORE_MAX = 3
 
+# Toggle to allow/disallow RCON fallback reads for general state refresh
+USE_RCON_FALLBACK = True
+
 COMPANY_RE = re.compile(
     r"#\s*:?(\d+)(?:\([^)]+\))?\s+Company Name:\s*'([^']*)'\s+"
     r"Year Founded:\s*(\d+)\s+Money:\s*[^0-9.,-]?\s*([-0-9,]+)\s+"
@@ -467,11 +470,15 @@ class HelpCommand(CommandHandler):
 class InfoCommand(CommandHandler):
     def execute(self, cid, args, state):
         info = [
-            "=== Server Info ===",
-            "South-East-Asia OpenTTD Server",
+            "=== Info ===",
+            f"Server: {self.bot.cfg.server_ip}:{self.bot.cfg.game_port}",
+            f"Admin: {self.bot.cfg.admin_name}",
+            f"Goal: First company value {self.bot._fmt(self.bot.cfg.goal_value)} wins",
+            "Game automatically pauses if no active companies",
+            "Automatically unpauses the game when there is a company",
             "Gamescript: Production Booster on primary industries",
             "Transport >70% boosts production, <50% reduces",
-            f"Goal: First company value ${self.bot._fmt(self.bot.cfg.goal_value)} wins"
+            f"Goal reset countdown: {self.bot.cfg.reset_countdown_seconds}s"
         ]
         self.bot.send_msg('\n'.join(info), cid)
 
@@ -484,7 +491,7 @@ class RulesCommand(CommandHandler):
             "2. No blocking players",
             "3. No cheating/exploits",
             "4. Be respectful",
-            f"5. Inactive >{self.bot.cfg.dead_co_age}y & <${self.bot._fmt(self.bot.cfg.dead_co_value)} auto-reset",
+            f"5. Inactive >{self.bot.cfg.dead_co_age}y & <{self.bot._fmt(self.bot.cfg.dead_co_value)} auto-reset",
             "6. Admin decisions final"
         ]
         self.bot.send_msg('\n'.join(rules), cid)
@@ -509,10 +516,20 @@ class CompanyValueCommand(CommandHandler):
         
         sorted_cos = sorted(active_companies.items(), key=lambda x: x[1]['value'], reverse=True)
         lines = ["=== Company Value Rankings ==="]
-        
-        for i, (co_id, data) in enumerate(sorted_cos[:10], 1):
+        top_entries = sorted_cos[:10]
+
+        max_name_len = max((len((d[1].get('name') or '').strip()) for d in top_entries), default=0)
+        # Keep name width reasonable for in-game chat; use floor/ceiling bounds
+        name_width = min(max(max_name_len, 10), 40)
+        max_val_len = max((len(self.bot._fmt(d[1].get('value', 0))) for d in top_entries), default=0)
+        val_width = max(max_val_len, 8)
+
+        for i, (co_id, data) in enumerate(top_entries, 1):
             pct = (data['value'] / self.bot.cfg.goal_value) * 100
-            lines.append(f"{i}. {data['name']} (#{data['display_id']}): ${self.bot._fmt(data['value'])} ({pct:.1f}%)")
+            pct_str = f"{pct:.0f}%"
+            name = (data.get('name') or '').strip()
+            val_str = self.bot._fmt(data.get('value', 0))
+            lines.append(f"{i:>2}. {name:<{name_width}} {val_str:>{val_width}} ({pct_str:>3})")
         
         self.bot.send_msg('\n'.join(lines), cid)
 
@@ -523,12 +540,16 @@ class ResetCommand(CommandHandler):
             if cid in self.bot.reset_pending:
                 self.bot.send_msg("Reset already pending. Type !yes to confirm or wait for timeout.", cid)
                 return
-        
-        co_id = self.bot._get_client_company(cid)
+
+        co_id = self.bot._get_client_company_rcon(cid)
         if co_id is None or co_id == Constants.SPECTATOR_ID.value:
             self.bot.send_msg("Must be in company to reset", cid)
             return
-        
+
+        if not self.bot._company_exists_rcon(co_id):
+            self.bot.send_msg(f"Company {co_id} not found.", cid)
+            return
+
         with self.bot.reset_lock:
             if cid in self.bot.reset_timers:
                 self.bot.reset_timers[cid].cancel()
@@ -559,7 +580,7 @@ class YesCommand(CommandHandler):
                 if timer:
                     timer.cancel()
         
-        current_co = self.bot._get_client_company(cid)
+        current_co = self.bot._get_client_company_rcon(cid)
         if current_co != pending_co_id:
             self.bot.send_msg(
                 f"Reset cancelled: you were in company {pending_co_id} but are now in company {current_co if current_co != Constants.SPECTATOR_ID.value else 'spectator'}. "
@@ -568,13 +589,11 @@ class YesCommand(CommandHandler):
             )
             return
         
-        self.bot._update_companies_from_rcon(reason="reset_verify")
-        
-        if not self.bot.companies_cache.get(pending_co_id):
+        if not self.bot._company_exists_rcon(pending_co_id):
             self.bot.send_msg(f"Company {pending_co_id} no longer exists.", cid)
             return
         
-        current_co_verify = self.bot._get_client_company(cid)
+        current_co_verify = self.bot._get_client_company_rcon(cid)
         if current_co_verify != pending_co_id:
             self.bot.send_msg(
                 f"Reset cancelled: company mismatch detected (expected {pending_co_id}, got {current_co_verify})",
@@ -631,6 +650,7 @@ class OpenTTDBot:
         self.cleanup_lock = threading.Lock()
         self.cleanup_in_progress = set()
         self.cleanup_semaphore = threading.Semaphore(CLEANUP_SEMAPHORE_MAX)
+        self.refresh_lock = threading.Lock()
         
         self.command_cooldown = {}
         self.command_cooldown_lock = threading.Lock()
@@ -673,6 +693,10 @@ class OpenTTDBot:
         self.admin.add_handler(openttdpacket.ClientInfoPacket)(self.on_client_info)
         self.admin.add_handler(openttdpacket.ClientUpdatePacket)(self.on_update)
         self.admin.add_handler(openttdpacket.ClientQuitPacket)(self.on_client_quit)
+        self.admin.add_handler(openttdpacket.CompanyInfoPacket)(self.on_company_info)
+        self.admin.add_handler(openttdpacket.CompanyUpdatePacket)(self.on_company_update)
+        self.admin.add_handler(openttdpacket.CompanyEconomyPacket)(self.on_company_economy)
+        self.admin.add_handler(openttdpacket.CompanyRemovePacket)(self.on_company_remove)
         self.admin.add_handler(openttdpacket.RconPacket)(self.on_rcon)
         self.admin.add_handler(openttdpacket.RconEndPacket)(self.on_rcon_end)
         self.admin.add_handler(openttdpacket.ErrorPacket)(self.on_error)
@@ -691,8 +715,16 @@ class OpenTTDBot:
                     self.reconnect_attempts = 0
                     self.rcon = RconHandler(self.admin, self.logger, self.cfg)
                     
+                    # Packet subscriptions: prefer rich packet data to avoid RCON reads
                     self.admin.subscribe(AdminUpdateType.CHAT)
                     self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
+                    self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.POLL)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.POLL)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.WEEKLY)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.POLL)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_STATS, AdminUpdateFrequency.WEEKLY)
+                    self.admin.subscribe(AdminUpdateType.COMPANY_STATS, AdminUpdateFrequency.POLL)
                     
                     time.sleep(0.5)
                     self._batch_refresh_state(reason="startup")
@@ -861,9 +893,10 @@ class OpenTTDBot:
     
     def on_client_info(self, admin, pkt):
         cid = pkt.id
+        co_id = pkt.company_id + 1 if pkt.company_id not in (None, Constants.SPECTATOR_ID.value) else pkt.company_id
         self.clients_cache.set(cid, {
             'name': pkt.name,
-            'company': pkt.company_id,
+            'company': co_id,
         })
         self.cache_ts = time.time()
         self._schedule_pause_check()
@@ -881,7 +914,7 @@ class OpenTTDBot:
     
     def on_update(self, admin, pkt):
         cid = pkt.id
-        co_id = pkt.company_id
+        co_id = pkt.company_id + 1 if pkt.company_id not in (None, Constants.SPECTATOR_ID.value) else pkt.company_id
         
         cached = self.clients_cache.get(cid) or {}
         self.clients_cache.set(cid, {
@@ -902,6 +935,63 @@ class OpenTTDBot:
                     except Exception:
                         pass
         
+        self._schedule_pause_check()
+
+    def on_company_info(self, admin, pkt):
+        co_id = pkt.id + 1
+        existing = self.companies_cache.get(co_id) or {'display_id': co_id}
+        existing.update({
+            'name': (pkt.name or '').strip(),
+            'manager': pkt.manager_name,
+            'start_date': pkt.year,
+            'color': getattr(pkt.color, 'name', str(pkt.color)),
+            'passworded': pkt.passworded,
+            'is_ai': pkt.is_ai,
+        })
+        self.companies_cache.set(co_id, existing)
+        self.cache_ts = time.time()
+        self.state_initialized = True
+        self._schedule_pause_check()
+
+    def on_company_update(self, admin, pkt):
+        co_id = pkt.id + 1
+        existing = self.companies_cache.get(co_id) or {'display_id': co_id}
+        existing.update({
+            'name': (pkt.name or '').strip(),
+            'manager': pkt.manager_name,
+            'color': getattr(pkt.color, 'name', str(pkt.color)),
+            'passworded': pkt.passworded,
+        })
+        self.companies_cache.set(co_id, existing)
+        self.cache_ts = time.time()
+        self.state_initialized = True
+        self._schedule_pause_check()
+
+    def on_company_economy(self, admin, pkt):
+        co_id = pkt.id + 1
+        existing = self.companies_cache.get(co_id) or {'display_id': co_id}
+        latest_value = 0
+        try:
+            if pkt.quarterly_info:
+                latest_value = pkt.quarterly_info[0].get('company_value', 0)
+        except Exception:
+            latest_value = 0
+        existing.update({
+            'money': pkt.money,
+            'loan': pkt.current_loan,
+            'income': pkt.income,
+            'delivered': pkt.delivered_cargo,
+            'value': latest_value or existing.get('value', 0),
+        })
+        self.companies_cache.set(co_id, existing)
+        self.cache_ts = time.time()
+        self.state_initialized = True
+        self._schedule_pause_check()
+
+    def on_company_remove(self, admin, pkt):
+        co_id = pkt.id + 1
+        self.companies_cache.delete(co_id)
+        self.cache_ts = time.time()
         self._schedule_pause_check()
     
     def on_new_game(self, admin, pkt):
@@ -948,6 +1038,14 @@ class OpenTTDBot:
 
         # If packet-driven cache is fresh, skip RCON
         if self._cache_valid():
+            has_client_company = any(
+                c.get('company') not in (None, Constants.SPECTATOR_ID.value)
+                for c in clients.values()
+            )
+            if not companies and has_client_company:
+                self._batch_refresh_state(reason="fresh_cache_clients_hint")
+                companies = {k: v for k, v in self.companies_cache.items()}
+                clients = {k: v for k, v in self.clients_cache.items()}
             return {'companies': companies, 'clients': clients}
         
         need_refresh = False
@@ -957,6 +1055,8 @@ class OpenTTDBot:
             need_refresh = True
         
         if need_refresh:
+            if not USE_RCON_FALLBACK:
+                return {'companies': companies, 'clients': clients}
             self._batch_refresh_state(reason="cache_refresh")
             companies = {k: v for k, v in self.companies_cache.items()}
             clients = {k: v for k, v in self.clients_cache.items()}
@@ -967,30 +1067,36 @@ class OpenTTDBot:
                 for c in clients.values()
             )
             if has_client_company:
+                if not USE_RCON_FALLBACK:
+                    return {'companies': companies, 'clients': clients}
                 self._batch_refresh_state(reason="clients_hint")
                 companies = {k: v for k, v in self.companies_cache.items()}
         
         return {'companies': companies, 'clients': clients}
     
     def _batch_refresh_state(self, reason=""):
-        now = time.time()
-        commands = []
-        
-        if now - self.last_companies_rcon >= RCON_REFRESH_TTL:
-            commands.append('companies')
-        if now - self.last_clients_rcon >= RCON_REFRESH_TTL:
-            commands.append('clients')
-        
-        if not commands:
+        if not USE_RCON_FALLBACK:
             return
-        
-        self.logger.debug("[Rcon] Using fallback for %s (reason=%s)", ','.join(commands), reason or 'cache_refresh')
-        results = self.rcon.batch_execute(commands)
-        
-        if 'companies' in results:
-            self._parse_companies(results['companies'], reason)
-        if 'clients' in results:
-            self._parse_clients(results['clients'])
+
+        with self.refresh_lock:
+            now = time.time()
+            commands = []
+            
+            if now - self.last_companies_rcon >= RCON_REFRESH_TTL:
+                commands.append('companies')
+            if now - self.last_clients_rcon >= RCON_REFRESH_TTL:
+                commands.append('clients')
+            
+            if not commands:
+                return
+            
+            self.logger.debug("[Rcon] Using fallback for %s (reason=%s)", ','.join(commands), reason or 'cache_refresh')
+            results = self.rcon.batch_execute(commands)
+            
+            if 'companies' in results:
+                self._parse_companies(results['companies'], reason)
+            if 'clients' in results:
+                self._parse_clients(results['clients'])
     
     def _parse_companies(self, output, reason=""):
         if not output.strip():
@@ -1079,26 +1185,33 @@ class OpenTTDBot:
         return 1950
     
     def _update_companies_from_rcon(self, reason="", force=False):
-        now = time.time()
-        age = now - self.last_companies_rcon
-        has_data = any(True for _ in self.companies_cache.items())
-
-        should_refresh = force or (not has_data) or (age >= RCON_REFRESH_TTL)
-        if not should_refresh:
-            self.logger.debug(
-                "[Rcon] Skip companies refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
-                age,
-                RCON_REFRESH_TTL,
-                reason or "n/a",
-            )
+        if not USE_RCON_FALLBACK:
             return
 
-        if reason:
-            self.logger.debug("[Rcon] Using fallback for companies (reason=%s, force=%s)", reason, force)
-        output = self.rcon.execute('companies')
-        self._parse_companies(output, reason)
+        with self.refresh_lock:
+            now = time.time()
+            age = now - self.last_companies_rcon
+            has_data = any(True for _ in self.companies_cache.items())
+
+            should_refresh = force or (not has_data) or (age >= RCON_REFRESH_TTL)
+            if not should_refresh:
+                self.logger.debug(
+                    "[Rcon] Skip companies refresh: age=%.2fs < ttl=%.2fs (reason=%s)",
+                    age,
+                    RCON_REFRESH_TTL,
+                    reason or "n/a",
+                )
+                return
+
+            if reason:
+                self.logger.debug("[Rcon] Using fallback for companies (reason=%s, force=%s)", reason, force)
+            output = self.rcon.execute('companies')
+            self._parse_companies(output, reason)
 
     def _update_clients_from_rcon(self, reason="", force=False):
+        if not USE_RCON_FALLBACK:
+            return
+
         now = time.time()
         age = now - self.last_clients_rcon
         has_data = any(True for _ in self.clients_cache.items())
@@ -1313,7 +1426,7 @@ class OpenTTDBot:
                 if self.phase in (GamePhase.GOAL_REACHED, GamePhase.RESETTING):
                     return MONITOR_INTERVAL_DEFAULT
 
-                self.logger.info("GOAL! %s=$%s", top['name'], self._fmt(top['value']))
+                self.logger.info("GOAL! %s=%s", top['name'], self._fmt(top['value']))
                 transitioned = self._transition_phase(GamePhase.GOAL_REACHED)
                 should_handle = transitioned
             if should_handle:
@@ -1400,7 +1513,7 @@ class OpenTTDBot:
 
             msg = f"""=== GOAL ACHIEVED ===
 Winner: {winner}
-Goal: ${self._fmt(self.cfg.goal_value)}
+Goal: {self._fmt(self.cfg.goal_value)}
 Map restart in {self.cfg.reset_countdown_seconds}s..."""
             self.send_msg(msg)
             threading.Thread(target=self._reset_countdown, daemon=True).start()
@@ -1456,6 +1569,42 @@ Map restart in {self.cfg.reset_countdown_seconds}s..."""
             return cached['company']
 
         return None
+
+    def _get_client_company_rcon(self, cid):
+        out = self.rcon.execute('clients', escape_args=False)
+        if not out:
+            self.logger.warning("[Rcon] clients lookup returned empty for cid=%s", cid)
+            return None
+        for line in out.splitlines():
+            m = CLIENT_RE.match(line)
+            if not m:
+                continue
+            try:
+                parsed_cid, _, parsed_co = m.groups()
+                if int(parsed_cid) == cid:
+                    parsed_co_int = int(parsed_co)
+                    return parsed_co_int if parsed_co_int != Constants.SPECTATOR_ID.value else Constants.SPECTATOR_ID.value
+            except (ValueError, AttributeError):
+                continue
+        self.logger.warning("[Rcon] cid=%s not found in clients output", cid)
+        return None
+
+    def _company_exists_rcon(self, co_id):
+        out = self.rcon.execute('companies', escape_args=False)
+        if not out:
+            self.logger.warning("[Rcon] companies lookup returned empty for co_id=%s", co_id)
+            return False
+        for line in out.splitlines():
+            m = COMPANY_RE.match(line)
+            if not m:
+                continue
+            try:
+                parsed_id = int(m.group(1))
+                if parsed_id == co_id:
+                    return True
+            except (ValueError, AttributeError):
+                continue
+        return False
     
     def _greet(self, cid):
         if self.stop_event.wait(GREETING_DELAY):
@@ -1492,9 +1641,9 @@ Map restart in {self.cfg.reset_countdown_seconds}s..."""
     
     def _fmt(self, val):
         if val >= 1_000_000_000:
-            return f"{val/1_000_000_000:.1f}B"
+            return f"{val/1_000_000_000:.1f}b"
         if val >= 1_000_000:
-            return f"{val/1_000_000:.1f}M"
+            return f"{val/1_000_000:.1f}m"
         if val >= 1_000:
             return f"{val/1_000:.1f}k"
         return str(val)
