@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-OpenTTD Admin - Packet Company and Client Info
+OpenTTD Admin - Get Company and Client Info
+Fixed: Removed invalid CLIENT_UPDATE subscription and fixed socket closing.
 """
 
 import json
 import logging
 import sys
 import time
-import math
 from datetime import date, timedelta
 from typing import Dict, Any
 
@@ -32,8 +32,7 @@ server_info: Dict[str, Any] = {}
 data_received = False
 
 def ottd_date_to_year(day_count: int) -> int:
-    # 365.2425 days per year on average
-    return math.floor(day_count / 365.2425)
+    return (date(1, 1, 1) + timedelta(days=day_count)).year - 1
 
 def load_settings(path: str = "settings.json") -> Dict[str, Any]:
     try:
@@ -43,7 +42,7 @@ def load_settings(path: str = "settings.json") -> Dict[str, Any]:
         return {
             "server_ip": "127.0.0.1",
             "admin_ports": [3977],
-            "admin_name": "python_admin",
+            "admin_name": "admin",
             "admin_pass": "password"
         }
 
@@ -60,7 +59,7 @@ def display_collected_data():
     print(f"SERVER: {server_info.get('name', 'Unknown')}")
     
     if game_date is not None:
-        print(f"Game Year {ottd_date_to_year(game_date)} (Packet: {game_date})")
+        print(f"Game Year {ottd_date_to_year(game_date)}")
     
     print(f"Companies ({len(companies)}):")
     for company_id, company in sorted(companies.items()):
