@@ -49,7 +49,7 @@ class OpenTTDMonitor:
         @self.admin.add_handler(openttdpacket.WelcomePacket)
         def handle_welcome(_admin, packet):
             self.server_name = packet.server_name
-            logger.info(f"Connected to server: {self.server_name}")
+            logger.info(f"Connected to server")
         
         @self.admin.add_handler(openttdpacket.DatePacket)
         def handle_date(_admin, packet):
@@ -144,10 +144,9 @@ class OpenTTDMonitor:
         print("\n" + "=" * 50)
         
         # Header
-        header_parts = [f"SERVER: {self.server_name}", f"IP:PORT {self.SERVER_IP}:{self.SERVER_PORT}"]
-        if self.game_date is not None:
-            header_parts.append(f"Game Year {self.ottd_date_to_year(self.game_date)}")
-        print(" | ".join(header_parts))
+        print(f"Server: {self.server_name}")
+        print(f"IP:Port: {self.SERVER_IP}:{self.SERVER_PORT}")
+        print(f"Year: {self.ottd_date_to_year(self.game_date) if self.game_date is not None else 'N/A'}")
         
         # Companies
         print(f"\nCompanies ({len(self.companies)}):")
