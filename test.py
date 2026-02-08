@@ -5,6 +5,8 @@ import sys
 import time
 from datetime import date, timedelta
 from typing import Dict, Any
+import urllib.request
+import json
 
 from pyopenttdadmin import *
 
@@ -12,10 +14,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class OpenTTDMonitor:
-    """Monitor for OpenTTD server status, companies, and clients."""
-    
-    # Configuration
+class test:
+     # Modify these configuration
     SERVER_IP = "127.0.0.1"
     SERVER_PORT = 3977
     ADMIN_PASSWORD = "PASSWORDPASSWORD"
@@ -34,6 +34,23 @@ class OpenTTDMonitor:
     def ottd_date_to_year(day_count: int) -> int:
         """Convert OpenTTD day count to year."""
         return (date(1, 1, 1) + timedelta(days=day_count)).year - 1
+    
+    def get_country_from_ip(self, ip: str) -> str:
+        """Get region and country from IP address using ipapi.co."""
+        try:
+            data = json.load(urllib.request.urlopen(f"https://ipapi.co/{ip}/json/"))
+            region = data.get("region", "")
+            country = data.get("country_name", "")
+            
+            if region and country:
+                return f"{region}, {country}"
+            elif country:
+                return country
+            else:
+                return "Unknown"
+        except Exception as e:
+            logger.warning(f"Failed to get country for IP {ip}: {e}")
+            return "Unknown"
     
     def send_poll(self, update_type: int, data: int):
         """Send a poll request to the server."""
@@ -168,7 +185,14 @@ class OpenTTDMonitor:
                 company_name = self.companies.get(company_id, {}).get('name', f'Company {display_id}')
                 role = f"Playing as '{company_name}' (#{display_id})"
             
-            print(f"  [{client_id}] {client.get('name', 'N/A')} | {role} | IP: {client.get('ip', 'Hidden')}")
+            ip = client.get('ip', 'Hidden')
+            client_name = client.get('name', 'N/A')
+            country = ""
+            
+            if client_name != 'Admin' and ip not in ('Hidden', 'N/A'):
+                country = f" ({self.get_country_from_ip(ip)})"
+            
+            print(f"  [{client_id}] {client_name} | {role} | IP: {ip}{country}")
         
         print("=" * 50)
     
@@ -202,8 +226,8 @@ class OpenTTDMonitor:
 
 
 def main():
-    monitor = OpenTTDMonitor()
-    monitor.run()
+    app = test()
+    app.run()
 
 
 if __name__ == "__main__":
