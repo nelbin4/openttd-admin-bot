@@ -4,12 +4,17 @@ OpenTTD Admin - Get Company and Client Info
 Fixed: Removed invalid CLIENT_UPDATE subscription and fixed socket closing.
 """
 
-import json
 import logging
 import sys
 import time
 from datetime import date, timedelta
 from typing import Dict, Any
+import getpass
+
+# --- Config ---
+ip = "127.0.0.1"
+port = 3977
+password = "PASSWORDPASSWORD"
 
 # Try to import the library, handle failure gracefully
 try:
@@ -34,18 +39,6 @@ data_received = False
 def ottd_date_to_year(day_count: int) -> int:
     return (date(1, 1, 1) + timedelta(days=day_count)).year - 1
 
-def load_settings(path: str = "settings.json") -> Dict[str, Any]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {
-            "server_ip": "127.0.0.1",
-            "admin_ports": [3977],
-            "admin_name": "admin",
-            "admin_pass": "password"
-        }
-
 def send_poll(admin: Admin, update_type: int, data: int):
     # Packet: [Size (2)][Type (1)][UpdateType (1)][Data (4)]
     PACKET_TYPE = 3  # ADMIN_PACKET_ADMIN_POLL
@@ -55,16 +48,22 @@ def send_poll(admin: Admin, update_type: int, data: int):
     admin.socket.sendall(packet)
 
 def display_collected_data():
-    print("\n" + "="*100)
-    print(f"SERVER: {server_info.get('name', 'Unknown')}")
-    
+    print("\n" + "="*30)
+    header_parts = [f"SERVER: {server_info.get('name', 'Unknown')}", f"IP:PORT {ip}:{port}"]
     if game_date is not None:
-        print(f"Game Year {ottd_date_to_year(game_date)}")
+        header_parts.append(f"Game Year {ottd_date_to_year(game_date)}")
+    print(" | ".join(header_parts))
     
     print(f"Companies ({len(companies)}):")
     for company_id, company in sorted(companies.items()):
+        display_id = company_id + 1
         value_str = f"£{company['value']:,}" if 'value' in company else "N/A"
-        print(f"  [{company_id}] {company.get('name', 'N/A')} | Manager: {company.get('manager', 'N/A')} | Value: {value_str}")
+        founded = company.get('founded')
+        if isinstance(founded, int):
+            founded_str = f"Year {founded}"
+        else:
+            founded_str = "Year N/A"
+        print(f"  [{display_id}] {company.get('name', 'N/A')} | {founded_str} | Value: {value_str}")
     
     print(f"Clients ({len(clients)}):")
     for client_id, client in sorted(clients.items()):
@@ -72,8 +71,9 @@ def display_collected_data():
         if cid == 255:
             role = "Spectator"
         else:
-            c_name = companies.get(cid, {}).get('name', f'Company {cid}')
-            role = f"Playing as '{c_name}' (#{cid})"
+            display_id = cid + 1
+            c_name = companies.get(cid, {}).get('name', f'Company {display_id}')
+            role = f"Playing as '{c_name}' (#{display_id})"
 
         joined_raw = client.get('join_date', 'N/A')
         if isinstance(joined_raw, int):
@@ -83,140 +83,142 @@ def display_collected_data():
 
         print(f"  [{client_id}] {client.get('name', 'N/A')} | {role} | Joined: {joined_str} | IP: {client.get('ip', 'Hidden')}")
     
-    print("="*100)
+    print("="*30)
 
-def main():
-    admin = None
-    try:
-        settings = load_settings()
-        server_ip = settings.get("server_ip")
-        admin_port = 3976
-        admin_name = settings.get("admin_name", "admin")
-        admin_pass = settings.get("admin_pass", "")
-        
-        logger.info(f"Connecting to {server_ip}:{admin_port} as '{admin_name}'")
-        admin = Admin(ip=server_ip, port=admin_port)
-        
-        # --- Packet Handlers ---
-        @admin.add_handler(openttdpacket.WelcomePacket)
-        def handle_welcome(_admin, packet):
-            logger.info(f"Connected to Server: {packet.server_name}")
-            server_info['name'] = packet.server_name
-            server_info['version'] = packet.version
+admin = None
+try:
+    server_ip = ip or input("Server IP: ").strip()
+    if not server_ip:
+        logger.error("Server IP is required.")
+        sys.exit(1)
 
-        @admin.add_handler(openttdpacket.DatePacket)
-        def handle_date(_admin, packet):
-            global game_date, data_received
-            game_date = packet.date
-            data_received = True
+    admin_port = port if port else 3976
+    admin_name = "Admin"
+    admin_pass = password or getpass.getpass("Admin Password: ")
 
-        @admin.add_handler(openttdpacket.CompanyInfoPacket)
-        def handle_company_info(_admin, packet):
+    # Keep displayed IP/port in sync with connection
+    globals()['ip'] = server_ip
+    globals()['port'] = admin_port
+
+    logger.info(f"Connecting to {server_ip}:{admin_port} as '{admin_name}'")
+    admin = Admin(ip=server_ip, port=admin_port)
+
+    # --- Packet Handlers ---
+    @admin.add_handler(openttdpacket.WelcomePacket)
+    def handle_welcome(_admin, packet):
+        logger.info(f"Connected to server")
+        server_info['name'] = packet.server_name
+        server_info['version'] = packet.version
+
+    @admin.add_handler(openttdpacket.DatePacket)
+    def handle_date(_admin, packet):
+        global game_date, data_received
+        game_date = packet.date
+        data_received = True
+
+    @admin.add_handler(openttdpacket.CompanyInfoPacket)
+    def handle_company_info(_admin, packet):
+        cid = packet.id
+        founded_year = None
+        if hasattr(packet, 'start_year') and isinstance(packet.start_year, int):
+            founded_year = packet.start_year
+        elif hasattr(packet, 'year') and isinstance(packet.year, int):
+            founded_year = packet.year
+        elif hasattr(packet, 'inaugurated') and isinstance(packet.inaugurated, int):
+            founded_year = ottd_date_to_year(packet.inaugurated)
+        elif hasattr(packet, 'year_founded') and isinstance(packet.year_founded, int):
+            founded_year = packet.year_founded
+
+        companies[cid] = {
+            'id': cid,
+            'name': packet.name,
+            'is_ai': packet.is_ai,
+            'founded': founded_year
+        }
+        logger.info(f"Received Info for Company #{cid}")
+
+    @admin.add_handler(openttdpacket.CompanyEconomyPacket)
+    def handle_company_economy(_admin, packet):
+        cid = packet.id
+        if cid not in companies: companies[cid] = {'id': cid}
+        companies[cid]['money'] = packet.money
+        if hasattr(packet, 'quarterly_info') and packet.quarterly_info:
+            last = packet.quarterly_info[-1]
+            companies[cid]['value'] = last['company_value']
+
+    @admin.add_handler(openttdpacket.ClientInfoPacket)
+    def handle_client_info(_admin, packet):
+        cid = packet.id
+        play_as = getattr(packet, 'play_as', getattr(packet, 'company_id', 255))
+        ip_addr = getattr(packet, 'ip', 'N/A')
+        clients[cid] = {
+            'id': cid,
+            'name': packet.name,
+            'ip': ip_addr,
+            'join_date': packet.joined,
+            'company_id': play_as
+        }
+        logger.info(f"Client Info: #{cid} {packet.name}")
+
+    if hasattr(openttdpacket, 'ClientUpdatePacket'):
+        @admin.add_handler(openttdpacket.ClientUpdatePacket)
+        def handle_client_update(_admin, packet):
             cid = packet.id
-            companies[cid] = {
-                'id': cid,
-                'name': packet.name,
-                'manager': packet.manager_name,
-                'is_ai': packet.is_ai
-            }
-            logger.info(f"Received Info for Company #{cid}")
+            if cid in clients:
+                clients[cid]['name'] = packet.name
+                clients[cid]['company_id'] = packet.play_as
+                logger.info(f"Client Update: #{cid} is now {packet.name}")
 
-        @admin.add_handler(openttdpacket.CompanyEconomyPacket)
-        def handle_company_economy(_admin, packet):
-            cid = packet.id
-            if cid not in companies: companies[cid] = {'id': cid}
-            companies[cid]['money'] = packet.money
-            if hasattr(packet, 'quarterly_info') and packet.quarterly_info:
-                last = packet.quarterly_info[-1]
-                companies[cid]['value'] = last['company_value']
+    @admin.add_handler(openttdpacket.ClientErrorPacket)
+    def handle_error(_admin, packet):
+        logger.error(f"Server Error: {packet.error}")
 
-        @admin.add_handler(openttdpacket.ClientInfoPacket)
-        def handle_client_info(_admin, packet):
-            cid = packet.id
-            # Handle potential differences in library attribute names
-            play_as = getattr(packet, 'play_as', getattr(packet, 'company_id', 255))
-            ip_addr = getattr(packet, 'ip', 'N/A')
-            
-            clients[cid] = {
-                'id': cid,
-                'name': packet.name,
-                'ip': ip_addr,
-                'join_date': packet.joined,
-                'company_id': play_as
-            }
-            logger.info(f"Client Info: #{cid} {packet.name}")
+    # --- Connection Sequence ---
+    admin.login(admin_name, admin_pass)
 
-        # Attempt to handle Client Update if the library supports the packet type
-        # (This handler is valid, but the subscription type for it is just CLIENT_INFO)
-        if hasattr(openttdpacket, 'ClientUpdatePacket'):
-            @admin.add_handler(openttdpacket.ClientUpdatePacket)
-            def handle_client_update(_admin, packet):
-                cid = packet.id
-                if cid in clients:
-                    clients[cid]['name'] = packet.name
-                    clients[cid]['company_id'] = packet.play_as
-                    logger.info(f"Client Update: #{cid} is now {packet.name}")
+    update_types = [
+        AdminUpdateType.DATE,
+        AdminUpdateType.CLIENT_INFO,
+        AdminUpdateType.COMPANY_INFO,
+        AdminUpdateType.COMPANY_ECONOMY,
+    ]
+    for ut in update_types:
+        admin.subscribe(ut, AdminUpdateFrequency.POLL)
 
-        @admin.add_handler(openttdpacket.ClientErrorPacket)
-        def handle_error(_admin, packet):
-            logger.error(f"Server Error: {packet.error}")
+    logger.info("Sending Polls...")
+    send_poll(admin, AdminUpdateType.DATE.value, 0)
+    send_poll(admin, AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+    for cid in range(16):
+        send_poll(admin, AdminUpdateType.COMPANY_INFO.value, cid)
+        send_poll(admin, AdminUpdateType.COMPANY_ECONOMY.value, cid)
 
-        # --- Connection Sequence ---
-        admin.login(admin_name, admin_pass)
-        
-        # Subscribe to updates (CLIENT_INFO covers updates and quits)
-        update_types = [
-            AdminUpdateType.DATE,
-            AdminUpdateType.CLIENT_INFO,
-            AdminUpdateType.COMPANY_INFO,
-            AdminUpdateType.COMPANY_ECONOMY,
-        ]
-        
-        for ut in update_types:
-            admin.subscribe(ut, AdminUpdateFrequency.POLL)
-            # Some servers require explicit AUTOMATIC subscription for live updates
-            # But POLL is usually safer for a one-shot script
-            # admin.subscribe(ut, AdminUpdateFrequency.AUTOMATIC)
-
-        logger.info("Sending Polls...")
-        send_poll(admin, AdminUpdateType.DATE.value, 0)
-        send_poll(admin, AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
-        for cid in range(16):
-            send_poll(admin, AdminUpdateType.COMPANY_INFO.value, cid)
-            send_poll(admin, AdminUpdateType.COMPANY_ECONOMY.value, cid)
-        
-        logger.info("Collecting data (up to 5 seconds)...")
-        start_time = time.time()
-        last_packet_ts = start_time
-        while time.time() - start_time < 5:
-            try:
-                packets = admin.recv()
-                if packets:
-                    for packet in packets:
-                        admin.handle_packet(packet)
-                    last_packet_ts = time.time()
-                # Exit early if we've gone quiet after getting packets
-                if data_received and (time.time() - last_packet_ts) > 0.3:
-                    break
-                time.sleep(0.05)
-            except KeyboardInterrupt:
+    logger.info("Collecting data")
+    start_time = time.time()
+    last_packet_ts = start_time
+    while time.time() - start_time < 5:
+        try:
+            packets = admin.recv()
+            if packets:
+                for packet in packets:
+                    admin.handle_packet(packet)
+                last_packet_ts = time.time()
+            if data_received and (time.time() - last_packet_ts) > 0.3:
                 break
-            except Exception as e:
-                logger.error(f"Connection error: {e}")
-                break
-        
-        display_collected_data()
-        
-    except Exception as e:
-        logger.error(f"Fatal Error: {e}", exc_info=True)
-    finally:
-        # Fixed: Check for socket existence directly
-        if admin and hasattr(admin, 'socket'):
-            try:
-                admin.socket.close()
-                logger.info("Connection Closed")
-            except Exception as e:
-                logger.error(f"Error closing socket: {e}")
+            time.sleep(0.05)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            break
 
-if __name__ == "__main__":
-    main()
+    display_collected_data()
+
+except Exception as e:
+    logger.error(f"Fatal Error: {e}", exc_info=True)
+finally:
+    if admin and hasattr(admin, 'socket'):
+        try:
+            admin.socket.close()
+            logger.info("Connection Closed")
+        except Exception as e:
+            logger.error(f"Error closing socket: {e}")
