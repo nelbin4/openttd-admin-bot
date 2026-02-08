@@ -11,7 +11,11 @@ ip = "127.0.0.1"
 port = 3977
 password = "PASSWORDPASSWORD"
 
-from pyopenttdadmin import *
+try:
+    from pyopenttdadmin import *
+except ImportError:
+    sys.path.insert(0, '/home/nelbin/openttd-admin/reference/pyOpenTTDAdmin')
+    from pyopenttdadmin import *
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -60,13 +64,7 @@ def display_collected_data():
             c_name = companies.get(cid, {}).get('name', f'Company {display_id}')
             role = f"Playing as '{c_name}' (#{display_id})"
 
-        joined_raw = client.get('join_date', 'N/A')
-        if isinstance(joined_raw, int):
-            joined_str = f"Year {ottd_date_to_year(joined_raw)}"
-        else:
-            joined_str = joined_raw
-
-        print(f"  [{client_id}] {client.get('name', 'N/A')} | {role} | Joined: {joined_str} | IP: {client.get('ip', 'Hidden')}")
+        print(f"  [{client_id}] {client.get('name', 'N/A')} | {role} | IP: {client.get('ip', 'Hidden')}")
     
     print("="*30)
 
@@ -101,12 +99,11 @@ try:
     @admin.add_handler(openttdpacket.CompanyInfoPacket)
     def handle_company_info(_admin, packet):
         cid = packet.id
-        founded_year = packet.year_founded if hasattr(packet, 'year_founded') and isinstance(packet.year_founded, int) else None
-
+        founded = packet.year if hasattr(packet, 'year') and isinstance(packet.year, int) else None
         companies[cid] = {
             'id': cid,
             'name': packet.name,
-            'founded': founded_year
+            'founded': founded
         }
         logger.info(f"Received Info for Company #{cid}")
 
