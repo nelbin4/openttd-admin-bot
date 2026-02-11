@@ -102,6 +102,8 @@ class Bot:
         async def on_company_info(admin, pkt):
             cid = 255 if pkt.id == 255 else pkt.id + 1
             self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
+            self.paused = False
+            await self.admin.send_rcon("unpause")
 
         @self.admin.add_handler(openttdpacket.CompanyEconomyPacket)
         async def on_company_economy(admin, pkt):
