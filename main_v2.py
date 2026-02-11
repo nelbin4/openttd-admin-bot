@@ -40,7 +40,7 @@ class Bot:
         self.game_date: int | None = None
         self.goal_reached = False
         self.paused: bool | None = None
-        self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}  # cid -> (company_id, timeout_task)
+        self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
 
     async def start(self):
         self.admin = AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port)
@@ -123,7 +123,6 @@ class Bot:
             if pkt.id in self.clients:
                 self.clients[pkt.id]['company_id'] = cid
             
-            # Check if client moved to spectator during reset
             if pkt.id in self.reset_pending and cid == 255:
                 company_id, timeout_task = self.reset_pending.pop(pkt.id)
                 timeout_task.cancel()
@@ -180,7 +179,7 @@ class Bot:
                 winner_name = data['name']
                 self.log.info(f"Goal reached: {winner_name} with {self.fmt(value)}")
                 
-                await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)}!")
+                await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)} company value!")
                 
                 for i in range(self.cfg.reset_countdown_seconds, 0, -1):
                     await asyncio.sleep(1)
@@ -190,7 +189,6 @@ class Bot:
                 self.companies.clear()
                 self.clients.clear()
                 self.goal_reached = False
-                await self.broadcast("Map reset!")
                 await self.poll_all()
                 break
 
@@ -205,7 +203,7 @@ class Bot:
                     if client.get('company_id') == cid:
                         await self.admin.send_rcon(f"move {client_id} 255")
                 await self.admin.send_rcon(f"reset_company {cid}")
-                await self.broadcast(f"Company #{cid} auto-reset (inactive)")
+                await self.broadcast(f"Inactive company {company_name} auto-reset")
 
     async def handle_command(self, cid: int, cmd: str):
         parts = cmd.split()
@@ -215,13 +213,13 @@ class Bot:
         command = parts[0].lower()
         
         if command == 'help':
-            await self.msg("Commands: !info, !rules, !cv, !reset", cid)
+            await self.msg("=== Chat Commands ===\n!info, !rules, !cv, !reset", cid)
         
         elif command == 'info':
-            await self.msg(f"Goal: {self.fmt(self.cfg.goal_value)} company value wins", cid)
+            await self.msg(f"=== Game Info ===\nGoal: first company to reach {self.fmt(self.cfg.goal_value)} wins\nGamescript: Production Booster\nTransport >70% increases <50% decreases", cid)
         
         elif command == 'rules':
-            await self.msg(f"1. No griefing 2. No cheating 3. Be respectful\nInactive >{self.cfg.dead_co_age}y & <{self.fmt(self.cfg.dead_co_value)} = auto-reset", cid)
+            await self.msg(f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5.Inactive companies (>{self.cfg.dead_co_age}y & <{self.fmt(self.cfg.dead_co_value)}) auto-reset", cid)
         
         elif command == 'cv':
             await self.poll_economy()
@@ -246,11 +244,11 @@ class Bot:
                     await asyncio.sleep(10)
                     if cid in self.reset_pending:
                         self.reset_pending.pop(cid)
-                        await self.msg("Reset cancelled (timeout)", cid)
+                        await self.msg("Reset cancelled", cid)
                 
                 timeout_task = asyncio.create_task(expire())
                 self.reset_pending[cid] = (company_id, timeout_task)
-                await self.msg(f"Move to spectator to reset {company_name} (10s timeout)", cid)
+                await self.msg(f"Move to spectator within 10s to reset", cid)
 
     async def msg(self, text: str, cid: int | None = None):
         for line in text.split('\n'):
