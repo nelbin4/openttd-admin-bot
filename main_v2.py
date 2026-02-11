@@ -40,20 +40,21 @@ class Bot:
         self.game_date: int | None = None
         self.goal_reached = False
         self.paused: bool | None = None
-        self.reset_pending: dict[int, int] = {}
+        self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}  # cid -> (company_id, timeout_task)
 
     async def start(self):
         self.admin = AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port)
         await self.admin.login(self.cfg.admin_name, self.cfg.admin_pass)
-        await self.admin.subscribe(AdminUpdateType.CHAT)
-        await self.admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
-        await self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
+        
+        await self.admin.subscribe(AdminUpdateType.CHAT, AdminUpdateFrequency.AUTOMATIC)
+        await self.admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.POLL)
+        await self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.POLL)
+        await self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.POLL)
+        await self.admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.POLL)
         
         self.setup_handlers()
-        await self.admin.send_rcon("unpause")
-        await self.poll_startup()
-        asyncio.create_task(self.poll_economy_loop())
+        await self.poll_all()
+        asyncio.create_task(self.economy_loop())
         await self.broadcast("Admin connected")
 
         while not self.stop.is_set():
@@ -70,6 +71,23 @@ class Bot:
         self.admin._writer.write(packet)
         await self.admin._writer.drain()
 
+    async def poll_all(self):
+        await self.poll(AdminUpdateType.DATE.value, 0)
+        await self.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+        for i in range(16):
+            await self.poll(AdminUpdateType.COMPANY_INFO.value, i)
+            await self.poll(AdminUpdateType.COMPANY_ECONOMY.value, i)
+        await asyncio.sleep(0.5)
+
+    async def poll_economy(self):
+        for i in range(16):
+            await self.poll(AdminUpdateType.COMPANY_ECONOMY.value, i)
+        await asyncio.sleep(0.3)
+
+    async def poll_clients(self):
+        await self.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+        await asyncio.sleep(0.2)
+
     def setup_handlers(self):
         @self.admin.add_handler(openttdpacket.ChatPacket)
         async def on_chat(admin, pkt):
@@ -83,37 +101,39 @@ class Bot:
         @self.admin.add_handler(openttdpacket.CompanyInfoPacket)
         async def on_company_info(admin, pkt):
             cid = 255 if pkt.id == 255 else pkt.id + 1
-            self.companies[cid] = {'name': pkt.name, 'founded': pkt.year}
-            self.log.info(f"Company #{cid}: {pkt.name}")
+            self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
 
         @self.admin.add_handler(openttdpacket.CompanyEconomyPacket)
         async def on_company_economy(admin, pkt):
             cid = 255 if pkt.id == 255 else pkt.id + 1
-            if pkt.quarterly_info:
-                if cid not in self.companies:
-                    self.companies[cid] = {'name': f'Company {cid}', 'founded': 1950}
+            if pkt.quarterly_info and cid in self.companies:
                 self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
 
         @self.admin.add_handler(openttdpacket.ClientInfoPacket)
         async def on_client_info(admin, pkt):
             cid = 255 if pkt.company_id == 255 else pkt.company_id + 1
-            if pkt.name == "<invalid>":
-                self.clients.pop(pkt.id, None)
-            else:
-                self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid, 'ip': pkt.ip}
-                if pkt.id in self.reset_pending and self.reset_pending[pkt.id] != cid:
-                    self.reset_pending.pop(pkt.id, None)
+            if pkt.name != "<invalid>":
+                self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
 
         @self.admin.add_handler(openttdpacket.ClientUpdatePacket)
         async def on_client_update(admin, pkt):
             cid = 255 if pkt.company_id == 255 else pkt.company_id + 1
             if pkt.id in self.clients:
-                self.clients[pkt.id].update({'name': pkt.name, 'company_id': cid})
+                self.clients[pkt.id]['company_id'] = cid
+            
+            # Check if client moved to spectator during reset
+            if pkt.id in self.reset_pending and cid == 255:
+                company_id, timeout_task = self.reset_pending.pop(pkt.id)
+                timeout_task.cancel()
+                await self.admin.send_rcon(f"reset_company {company_id}")
+                await self.msg(f"Company #{company_id} reset", pkt.id)
 
         @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         async def on_client_remove(admin, pkt):
             self.clients.pop(pkt.id, None)
-            self.reset_pending.pop(pkt.id, None)
+            if pkt.id in self.reset_pending:
+                _, timeout_task = self.reset_pending.pop(pkt.id)
+                timeout_task.cancel()
 
         @self.admin.add_handler(openttdpacket.CompanyRemovePacket)
         async def on_company_remove(admin, pkt):
@@ -127,55 +147,50 @@ class Bot:
             self.game_date = None
             self.goal_reached = False
             self.paused = None
-            await self.poll_startup()
+            await self.poll_all()
 
         @self.admin.add_handler(openttdpacket.ShutdownPacket)
         async def on_shutdown(admin, pkt):
             self.stop.set()
 
-    async def poll_startup(self):
-        await self.poll(AdminUpdateType.DATE.value, 0)
-        await self.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
-        for i in range(16):
-            await self.poll(AdminUpdateType.COMPANY_INFO.value, i)
-            await self.poll(AdminUpdateType.COMPANY_ECONOMY.value, i)
-        await asyncio.sleep(2)
-
-    async def poll_economy_loop(self):
+    async def economy_loop(self):
         while not self.stop.is_set():
-            for cid in list(self.companies.keys()):
-                await self.poll(AdminUpdateType.COMPANY_ECONOMY.value, cid - 1 if cid != 255 else 255)
-            
-            await self.check_dead_companies()
-            self.check_goal()
-            
-            desired = len(self.companies) == 0
-            if desired != self.paused:
-                await self.admin.send_rcon("pause" if desired else "unpause")
-                self.paused = desired
-            
             await asyncio.sleep(30)
+            await self.poll_economy()
+            await self.check_dead_companies()
+            await self.check_goal()
+            await self.sync_pause()
 
-    def check_goal(self):
+    async def sync_pause(self):
+        desired = len(self.companies) == 0
+        if desired != self.paused:
+            await self.admin.send_rcon("pause" if desired else "unpause")
+            self.paused = desired
+
+    async def check_goal(self):
         if self.goal_reached:
             return
+        
         for cid, data in self.companies.items():
-            if data.get('value', 0) >= self.cfg.goal_value:
+            value = data.get('value', 0)
+            if value >= self.cfg.goal_value:
                 self.goal_reached = True
-                asyncio.create_task(self.broadcast(f"{data['name']} WINS! Goal {self.fmt(self.cfg.goal_value)} reached!"))
-                asyncio.create_task(self.countdown_reset())
+                winner_name = data['name']
+                self.log.info(f"Goal reached: {winner_name} with {self.fmt(value)}")
+                
+                await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)}!")
+                
+                for i in range(self.cfg.reset_countdown_seconds, 0, -1):
+                    await asyncio.sleep(1)
+                    await self.broadcast(f"Map resets in {i}s...")
+                
+                await self.admin.send_rcon(f"load {self.cfg.load_scenario}")
+                self.companies.clear()
+                self.clients.clear()
+                self.goal_reached = False
+                await self.broadcast("Map reset!")
+                await self.poll_all()
                 break
-
-    async def countdown_reset(self):
-        for i in range(self.cfg.reset_countdown_seconds, 0, -1):
-            await self.broadcast(f"Map resets in {i}s...")
-            await asyncio.sleep(1)
-        await self.admin.send_rcon(f"load {self.cfg.load_scenario}")
-        self.companies.clear()
-        self.clients.clear()
-        self.goal_reached = False
-        await self.broadcast("Map reset!")
-        await self.poll_startup()
 
     async def check_dead_companies(self):
         if not self.game_date:
@@ -188,7 +203,6 @@ class Bot:
                     if client.get('company_id') == cid:
                         await self.admin.send_rcon(f"move {client_id} 255")
                 await self.admin.send_rcon(f"reset_company {cid}")
-                self.companies.pop(cid, None)
                 await self.broadcast(f"Company #{cid} auto-reset (inactive)")
 
     async def handle_command(self, cid: int, cmd: str):
@@ -200,11 +214,15 @@ class Bot:
         
         if command == 'help':
             await self.msg("Commands: !info, !rules, !cv, !reset", cid)
+        
         elif command == 'info':
             await self.msg(f"Goal: {self.fmt(self.cfg.goal_value)} company value wins", cid)
+        
         elif command == 'rules':
             await self.msg(f"1. No griefing 2. No cheating 3. Be respectful\nInactive >{self.cfg.dead_co_age}y & <{self.fmt(self.cfg.dead_co_value)} = auto-reset", cid)
+        
         elif command == 'cv':
+            await self.poll_economy()
             if not self.companies:
                 await self.msg("No companies", cid)
             else:
@@ -212,23 +230,25 @@ class Bot:
                 for i, (_, data) in enumerate(sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10], 1):
                     lines.append(f"{i}. {data.get('name', 'N/A')}: {self.fmt(data.get('value', 0))}")
                 await self.msg('\n'.join(lines), cid)
+        
         elif command == 'reset':
+            await self.poll_clients()
             client = self.clients.get(cid)
             if not client or client.get('company_id') == 255:
                 await self.msg("Must be in a company to reset", cid)
             else:
                 company_id = client['company_id']
-                self.reset_pending[cid] = company_id
-                await self.msg(f"Move to spectator within 10s to reset {self.companies.get(company_id, {}).get('name', f'Company {company_id}')}", cid)
+                company_name = self.companies.get(company_id, {}).get('name', f'Company {company_id}')
                 
                 async def expire():
                     await asyncio.sleep(10)
-                    if self.reset_pending.pop(cid, None) and self.clients.get(cid, {}).get('company_id') == 255:
-                        await self.admin.send_rcon(f"reset_company {company_id}")
-                        self.companies.pop(company_id, None)
-                        await self.msg(f"Company #{company_id} reset", cid)
+                    if cid in self.reset_pending:
+                        self.reset_pending.pop(cid)
+                        await self.msg("Reset cancelled (timeout)", cid)
                 
-                asyncio.create_task(expire())
+                timeout_task = asyncio.create_task(expire())
+                self.reset_pending[cid] = (company_id, timeout_task)
+                await self.msg(f"Move to spectator to reset {company_name} (10s timeout)", cid)
 
     async def msg(self, text: str, cid: int | None = None):
         for line in text.split('\n'):
