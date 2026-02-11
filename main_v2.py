@@ -3,15 +3,12 @@ import logging
 import signal
 import sys
 import asyncio
-import time
-import inspect
 from dataclasses import dataclass
+from datetime import date, timedelta
 
 from pyopenttdadmin import openttdpacket, AdminUpdateType, AdminUpdateFrequency
 from pyopenttdadmin.packet import *
 from pyopenttdadmin.enums import *
-from datetime import date, timedelta
-from typing import Callable, Coroutine
 
 class Admin:
     def __init__(self, ip: str = "127.0.0.1", port: int = 3977):
@@ -19,50 +16,32 @@ class Admin:
         self.port = port
         self._buffer = b""
         self._packets = []
-
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-
-        self.handlers: dict[PacketType, list[Callable[[Admin, Packet], Coroutine]]] = {}
-    
-    async def __aenter__(self):
-        await self.connect()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_value, traceback):
-        if self._writer is not None:
-            if not self._writer.is_closing():
-                self._writer.close()
-            
-            await self._writer.wait_closed()
+        self.handlers: dict[type, list] = {}
     
     async def connect(self):
         self._reader, self._writer = await asyncio.open_connection(self.ip, self.port)
     
-    async def login(self, name: str, password: str, version: int = 0):
-        if self._writer is None:
-            await self.connect()
-        
-        packet = AdminJoinPacket(password, name, str(version))
-        await self._send(packet)
+    async def login(self, name: str, password: str):
+        packet = AdminJoinPacket(password, name, "0")
+        await self.send(packet)
     
-    async def _send(self, packet: Packet):
-        if self._writer is None:
-            raise ValueError("Not connected to server.")
+    async def send(self, packet: Packet):
+        if not self._writer:
+            raise ValueError("Not connected")
         
         data = packet.to_bytes()
         packet_type = packet.packet_type.value.to_bytes(1, 'little')
         length = (len(data) + 3).to_bytes(2, 'little')
-
         self._writer.write(length + packet_type + data)
         await self._writer.drain()
     
     async def recv(self) -> list[Packet]:
-        if self._reader is None:
-            raise ValueError("Not connected to server.")
+        if not self._reader:
+            raise ValueError("Not connected")
         
         self._buffer += await self._reader.read(1024)
-
         if not self._buffer:
             return []
         
@@ -78,60 +57,45 @@ class Admin:
             if len(self._buffer) < packet_len:
                 if fetched > 5:
                     return packets
-
                 self._buffer += await self._reader.read(1024)
                 fetched += 1
                 continue
             
-            packets.append(Packet.create_packet(self._buffer[2: packet_len]))
+            packets.append(Packet.create_packet(self._buffer[2:packet_len]))
             self._buffer = self._buffer[packet_len:]
-
             if not self._buffer:
                 return packets
-        
-    async def _rcon(self, command: str):
-        packet = AdminRconPacket(command)
-        await self._send(packet)
     
-    async def _chat(self, message: str, action: Actions = Actions.CHAT, desttype: ChatDestTypes = ChatDestTypes.BROADCAST, id: int = 0):
-        packet = AdminChatPacket(message, action, desttype, id)
-        await self._send(packet)
+    async def poll(self, update_type: int, data: int):
+        """Send manual poll packet (type 3)"""
+        PACKET_TYPE = 3
+        payload = update_type.to_bytes(1, 'little') + data.to_bytes(4, 'little')
+        packet_size = 3 + len(payload)
+        packet = packet_size.to_bytes(2, 'little') + PACKET_TYPE.to_bytes(1, 'little') + payload
+        self._writer.write(packet)
+        await self._writer.drain()
     
-    async def _subscribe(self, type: AdminUpdateType, frequency: AdminUpdateFrequency = AdminUpdateFrequency.AUTOMATIC):
-        packet = AdminSubscribePacket(type, frequency)
-        await self._send(packet)
+    async def rcon(self, command: str):
+        await self.send(AdminRconPacket(command))
     
-    async def send_rcon(self, command: str) -> None:
-        await self._rcon(command)
+    async def chat(self, message: str, action=Actions.CHAT, desttype=ChatDestTypes.BROADCAST, client_id=0):
+        await self.send(AdminChatPacket(message, action, desttype, client_id))
     
-    async def send_global(self, message: str) -> None:
-        await self._chat(message)
-
-    async def subscribe(self, type: AdminUpdateType, frequency: AdminUpdateFrequency = AdminUpdateFrequency.AUTOMATIC) -> None:
-        if frequency not in AdminUpdateTypeFrequencyMatrix[type]:
-            raise ValueError(f"Invalid frequency ({frequency}) for {type}")
-        
-        await self._subscribe(type, frequency)
+    async def subscribe(self, update_type: AdminUpdateType, freq=AdminUpdateFrequency.AUTOMATIC):
+        if freq not in AdminUpdateTypeFrequencyMatrix[update_type]:
+            raise ValueError(f"Invalid frequency for {update_type}")
+        await self.send(AdminSubscribePacket(update_type, freq))
     
     async def handle_packet(self, packet: Packet):
-        tasks = set()
-        for handler in self.handlers.get(type(packet), []):
-            tasks.add(handler(self, packet))
-        
-        await asyncio.gather(*tasks)
+        tasks = [h(self, packet) for h in self.handlers.get(type(packet), [])]
+        if tasks:
+            await asyncio.gather(*tasks)
     
-    def add_handler(self, *packets: type[Packet]):
-        def decorator(func: Callable[[Admin, Packet], Coroutine]):
-            if not inspect.iscoroutinefunction(func):
-                raise ValueError("Handler must be a coroutine.")
-
-            for packet_type in packets:
-                if packet_type not in self.handlers:
-                    self.handlers[packet_type] = []
-                self.handlers[packet_type].append(func)
-            
+    def on(self, *packet_types):
+        def decorator(func):
+            for ptype in packet_types:
+                self.handlers.setdefault(ptype, []).append(func)
             return func
-        
         return decorator
 
 @dataclass
@@ -144,389 +108,354 @@ class Config:
     load_scenario: str
     dead_co_age: int
     dead_co_value: int
-    reset_countdown_seconds: int
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
-class AsyncRconBot:
+class Bot:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.logger = logging.getLogger(f"[S{cfg.admin_port}]")
+        self.log = logging.getLogger(f"[S{cfg.admin_port}]")
         self.admin = None
-        self.stop_event = asyncio.Event()
-        self.companies = {}
-        self.clients = {}
+        self.stop = asyncio.Event()
+        
+        # IMPORTANT: Store companies/clients using GAME IDs (1-based), not packet IDs (0-based)
+        self.companies = {}  # game_id -> {name, founded, value, ...}
+        self.clients = {}    # client_id -> {name, company_id (game), ip}
         self.game_date = None
         self.goal_reached = False
         self.paused = False
-        self.reset_pending = {}
-        self.cleanup_pending = set()
-        self.data_received = False
-        
+        self.reset_pending = {}  # client_id -> company_id (game)
+    
+    def packet_to_game_id(self, packet_id: int) -> int:
+        """Convert 0-based packet ID to 1-based game ID"""
+        return packet_id + 1
+    
     async def start(self):
         self.admin = Admin(self.cfg.server_ip, self.cfg.admin_port)
         await self.admin.connect()
         await self.admin.login(self.cfg.admin_name, self.cfg.admin_pass)
         
-        await self.admin.subscribe(openttdpacket.AdminUpdateType.CHAT)
-        await self.admin.subscribe(openttdpacket.AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
-        await self.admin.subscribe(openttdpacket.AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(openttdpacket.AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(openttdpacket.AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.MONTHLY)
+        # Subscribe to updates
+        await self.admin.subscribe(AdminUpdateType.CHAT)
+        await self.admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
+        await self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
+        await self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
+        await self.admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.MONTHLY)
         
-        self.admin.add_handler(openttdpacket.ChatPacket)(self.on_chat)
-        self._setup_handlers()
-        await self._poll_startup()
+        self.setup_handlers()
+        await self.poll_startup()
+        await self.broadcast("Admin connected")
         
-        await self._broadcast("Admin connected")
-        
-        while not self.stop_event.is_set():
-            try:
-                packets = await self.admin.recv()
-                for packet in packets:
-                    await self.admin.handle_packet(packet)
-                    self.data_received = True
-            except:
-                pass
+        # Main loop
+        while not self.stop.is_set():
+            packets = await self.admin.recv()
+            for packet in packets:
+                await self.admin.handle_packet(packet)
             
-            self._check_goal()
-            await self._sync_pause_state()
+            self.check_goal()
+            await self.sync_pause()
             await asyncio.sleep(0.1)
     
-    async def on_chat(self, admin, pkt):
-        msg = pkt.message.strip()
-        cid = pkt.id
-        self.logger.info(f"[CHAT] Client {cid}: {msg}")
+    def setup_handlers(self):
+        @self.admin.on(openttdpacket.ChatPacket)
+        async def on_chat(admin, pkt):
+            msg = pkt.message.strip()
+            if msg.startswith('!'):
+                await self.handle_command(pkt.id, msg[1:])
         
-        if msg.startswith('!'):
-            await self._handle_command(cid, msg[1:])
-    
-    def _setup_handlers(self):
-        self.admin.add_handler(openttdpacket.DatePacket)(self._on_date)
-        self.admin.add_handler(openttdpacket.CompanyInfoPacket)(self._on_company_info)
-        self.admin.add_handler(openttdpacket.CompanyEconomyPacket)(self._on_company_economy)
-        self.admin.add_handler(openttdpacket.ClientInfoPacket)(self._on_client_info)
-        self.admin.add_handler(openttdpacket.CompanyRemovePacket)(self._on_company_remove)
-
-    async def _on_date(self, _admin, packet):
-        self.game_date = packet.date
-        self.logger.info(f"Received date: {self.game_date} ({self._fmt_date(self.game_date)})")
-
-    def _co_id(self, packet_id: int) -> int:
-        return packet_id + 1
-
-    async def _on_company_info(self, _admin, packet):
-        co_id = self._co_id(packet.id)
-        company_name = packet.name or f"Company {co_id}"
-        self.companies[co_id] = {
-            'id': co_id,
-            'name': company_name,
-            'founded': getattr(packet, 'year', 1950) or 1950
-        }
-        self.logger.info(f"Company {co_id}: {company_name}")
-        await self._sync_pause_state()
-
-    async def _on_company_remove(self, _admin, packet):
-        co_id = self._co_id(packet.id)
-        self.companies.pop(co_id, None)
-        self.logger.info(f"Company {co_id} removed")
-        await self._sync_pause_state()
-
-    async def _on_company_economy(self, _admin, packet):
-        co_id = self._co_id(packet.id)
-        if co_id not in self.companies:
-            self.companies[co_id] = {'id': co_id, 'name': f'Company {co_id}', 'founded': 1950}
-
-        if getattr(packet, 'quarterly_info', None):
-            self.companies[co_id]['value'] = packet.quarterly_info[-1]['company_value']
-            self.logger.info(f"Company {co_id} value: {self.companies[co_id]['value']}")
-            self._check_dead_companies()
-
-    async def _on_client_info(self, _admin, packet):
-        company_id = getattr(packet, 'play_as', getattr(packet, 'company_id', 255))
-        cid = packet.id
-        self.clients[cid] = {
-            'id': cid,
-            'name': packet.name,
-            'company': company_id if company_id != 255 else 255
-        }
-        if cid in self.reset_pending and self.reset_pending[cid] != (company_id if company_id != 255 else 255):
-            self.reset_pending.pop(cid, None)
-        self.logger.info(f"Client {cid}: {packet.name} in company {company_id if company_id != 255 else 255}")
-        await self._sync_pause_state()
-
-    async def _wait_for_initial_data(self):
-        """Wait for initial data to arrive via automatic subscriptions."""
-        self.logger.info("Waiting for initial data via subscriptions...")
+        @self.admin.on(openttdpacket.DatePacket)
+        async def on_date(admin, pkt):
+            self.game_date = pkt.date
         
-        max_wait = 10
-        start_time = time.time()
-        
-        while time.time() - start_time < max_wait:
-            try:
-                packets = await self.admin.recv()
-                for packet in packets:
-                    await self.admin.handle_packet(packet)
-                    self.data_received = True
-            except:
-                pass
+        @self.admin.on(openttdpacket.CompanyInfoPacket)
+        async def on_company_info(admin, pkt):
+            game_id = self.packet_to_game_id(pkt.id)
+            founded = getattr(pkt, 'year', 1950) or 1950
             
-            if self.game_date is not None or self.companies:
-                self.logger.info(f"Initial data received - Date: {self.game_date}, Companies: {len(self.companies)}")
-                break
-                
-            await asyncio.sleep(0.5)
-        else:
-            self.logger.warning("Timeout waiting for initial data, proceeding anyway")
+            self.companies[game_id] = {
+                'name': pkt.name,
+                'founded': founded
+            }
+            self.log.info(f"Company #{game_id}: {pkt.name} (founded {founded})")
         
-        await self._sync_pause_state()
-
-    async def _poll_manual(self, update_type: int, data: int):
-        PACKET_TYPE = 3
-        payload = update_type.to_bytes(1, 'little') + data.to_bytes(4, 'little')
-        packet_size = 3 + len(payload)
-        packet = packet_size.to_bytes(2, 'little') + PACKET_TYPE.to_bytes(1, 'little') + payload
-        if self.admin and self.admin._writer:
-            self.admin._writer.write(packet)
-            await self.admin._writer.drain()
-
-    async def _poll_startup(self):
-        self.logger.info("Polling startup data (date/clients/companies)")
-        await self._poll_manual(openttdpacket.AdminUpdateType.DATE.value, 0)
-        await self._poll_manual(openttdpacket.AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
-        for company_id in range(16):
-            await self._poll_manual(openttdpacket.AdminUpdateType.COMPANY_INFO.value, company_id)
-            await self._poll_manual(openttdpacket.AdminUpdateType.COMPANY_ECONOMY.value, company_id)
-
-    def _check_goal(self):
-        """Placeholder goal check to avoid crash; implement logic if needed."""
-        return
-
-    def _check_dead_companies(self):
-        """Check for dead companies and reset them immediately."""
+        @self.admin.on(openttdpacket.CompanyEconomyPacket)
+        async def on_company_economy(admin, pkt):
+            game_id = self.packet_to_game_id(pkt.id)
+            
+            if game_id not in self.companies:
+                self.companies[game_id] = {'name': f'Company {game_id}', 'founded': 1950}
+            
+            # Handle different packet formats
+            if getattr(pkt, 'quarterly_info', None):
+                value = pkt.quarterly_info[-1]['company_value']
+            elif hasattr(pkt, 'company_value'):
+                value = pkt.company_value
+            else:
+                return
+            
+            self.companies[game_id]['value'] = value
+            self.check_dead_companies()
+        
+        @self.admin.on(openttdpacket.ClientInfoPacket)
+        async def on_client_info(admin, pkt):
+            cid = pkt.id
+            company_id = getattr(pkt, 'play_as', getattr(pkt, 'company_id', 255))
+            
+            # Convert to game ID if not spectator
+            if company_id != 255:
+                company_id = self.packet_to_game_id(company_id)
+            
+            if pkt.name == "<invalid>":
+                self.clients.pop(cid, None)
+            else:
+                self.clients[cid] = {
+                    'name': pkt.name,
+                    'company_id': company_id,
+                    'ip': getattr(pkt, 'ip', 'N/A')
+                }
+                
+                # Cancel pending reset if company changed
+                if cid in self.reset_pending and self.reset_pending[cid] != company_id:
+                    self.reset_pending.pop(cid, None)
+            
+            await self.sync_pause()
+        
+        @self.admin.on(openttdpacket.CompanyRemovePacket)
+        async def on_company_remove(admin, pkt):
+            game_id = self.packet_to_game_id(pkt.id)
+            self.companies.pop(game_id, None)
+            self.log.info(f"Company #{game_id} removed")
+    
+    async def poll_startup(self):
+        """Poll for initial server state (like test.py)"""
+        self.log.info("Polling initial data...")
+        await self.admin.poll(AdminUpdateType.DATE.value, 0)
+        await self.admin.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+        
+        # Poll all possible companies (0-15 in packet space)
+        for packet_id in range(16):
+            await self.admin.poll(AdminUpdateType.COMPANY_INFO.value, packet_id)
+            await self.admin.poll(AdminUpdateType.COMPANY_ECONOMY.value, packet_id)
+        
+        await asyncio.sleep(2)  # Wait for responses
+    
+    def check_goal(self):
+        if self.goal_reached:
+            return
+        
+        for game_id, data in self.companies.items():
+            if data.get('value', 0) >= self.cfg.goal_value:
+                self.goal_reached = True
+                asyncio.create_task(self.broadcast(
+                    f"{data['name']} WINS! Goal {self.fmt(self.cfg.goal_value)} reached!"
+                ))
+                asyncio.create_task(self.countdown_reset())
+                return
+    
+    async def countdown_reset(self):
+        for i in range(20, 0, -1):
+            await self.broadcast(f"Map resets in {i}s...")
+            await asyncio.sleep(1)
+        
+        await self.admin.rcon(f"load {self.cfg.load_scenario}")
+        self.companies.clear()
+        self.goal_reached = False
+        await self.broadcast("Map reset!")
+    
+    def check_dead_companies(self):
         if not self.game_date or not self.companies:
             return
         
-        current_year = self._get_current_year()
+        current_year = (date(1, 1, 1) + timedelta(days=self.game_date)).year - 1
         
-        for co_id, company_data in list(self.companies.items()):
-            company_age = current_year - company_data.get('founded', 1950)
-            company_value = company_data.get('value', 0)
+        for game_id, data in list(self.companies.items()):
+            age = current_year - data.get('founded', 1950)
+            value = data.get('value', 0)
             
-            if company_age >= self.cfg.dead_co_age and company_value < self.cfg.dead_co_value:
-                self.logger.info(f"Auto-cleaning Company {co_id}: age={company_age}y, value={self._fmt(company_value)}")
+            if age >= self.cfg.dead_co_age and value < self.cfg.dead_co_value:
+                self.log.info(f"Auto-reset Company #{game_id}: age={age}y, value={self.fmt(value)}")
                 
-                for cid, client in list(self.clients.items()):
-                    if client.get('company') == co_id:
-                        asyncio.create_task(self.admin.send_rcon(f"move {cid} 255"))
+                # Move clients out first
+                for cid, client in self.clients.items():
+                    if client.get('company_id') == game_id:
+                        game_client_id = cid + 1
+                        asyncio.create_task(self.admin.rcon(f"move {game_client_id} 255"))
                 
-                asyncio.create_task(self.admin.send_rcon(f"reset_company {co_id}"))
-                self.companies.pop(co_id, None)
-                
-                asyncio.create_task(self._broadcast(f"Company {co_id} auto-reset for inactivity"))
-
-    async def _sync_pause_state(self):
-        """Ensure game pause state matches presence of companies."""
-        active_players = [c for c in self.clients.values() if c.get('company') != 255]
-        should_pause = len(self.companies) == 0 and len(active_players) == 0
-        if should_pause == self.paused:
-            return
-
-        await self.admin.send_rcon("pause" if should_pause else "unpause")
-        self.paused = should_pause
-        self.logger.info(f"Game {'paused' if should_pause else 'unpaused'} (companies: {len(self.companies)}, players: {len(active_players)})")
+                asyncio.create_task(self.admin.rcon(f"reset_company {game_id}"))
+                self.companies.pop(game_id, None)
+                asyncio.create_task(self.broadcast(f"Company #{game_id} auto-reset (inactive)"))
     
-    async def _handle_command(self, cid: int, cmd: str):
+    async def sync_pause(self):
+        active = [c for c in self.clients.values() if c.get('company_id') != 255]
+        should_pause = len(self.companies) == 0
+        
+        if should_pause != self.paused:
+            await self.admin.rcon("pause" if should_pause else "unpause")
+            self.paused = should_pause
+    
+    async def handle_command(self, cid: int, cmd: str):
         parts = cmd.split()
         if not parts:
             return
         
         command = parts[0].lower()
-        args = parts[1:]
         
         if command == 'help':
-            await self._send_msg("Commands: !info, !rules, !cv, !reset", cid)
+            await self.msg("Commands: !info, !rules, !cv, !reset", cid)
+        
         elif command == 'info':
-            info = [
-                "=== Info ===",
-                f"Goal: First company value {self._fmt(self.cfg.goal_value)} wins",
-                "Gamescript: Production Booster on primary industries",
-                "Transported >70% boosts production, <50% reduces",
-            ]
-            await self._send_msg('\n'.join(info), cid)
+            await self.msg(
+                f"=== Info ===\n"
+                f"Goal: {self.fmt(self.cfg.goal_value)} company value wins\n"
+                f"Production Booster: >70% transported = boost, <50% = reduce",
+                cid
+            )
+        
         elif command == 'rules':
-            rules = [
-                "=== Rules ===",
-                "1. No griefing/sabotage",
-                "2. No blocking players",
-                "3. No cheating/exploits",
-                "4. Be respectful",
-                f"5. Inactive >{self.cfg.dead_co_age}y & <{self._fmt(self.cfg.dead_co_value)} auto-reset",
-                "6. Admin decisions are final"
-            ]
-            await self._send_msg('\n'.join(rules), cid)
+            await self.msg(
+                f"=== Rules ===\n"
+                f"1. No griefing/blocking\n"
+                f"2. No cheating\n"
+                f"3. Be respectful\n"
+                f"4. Inactive >{self.cfg.dead_co_age}y & <{self.fmt(self.cfg.dead_co_value)} = auto-reset",
+                cid
+            )
+        
         elif command == 'cv':
-            await self._show_company_values(cid)
+            await self.show_company_values(cid)
+        
         elif command == 'reset':
-            await self._handle_reset_command(cid)
+            await self.handle_reset(cid)
+        
         elif command == 'yes':
-            await self._confirm_reset(cid)
+            await self.confirm_reset(cid)
     
-    async def _show_company_values(self, cid: int):
+    async def show_company_values(self, cid: int):
         if not self.companies:
-            await self._send_msg("No companies", cid)
+            await self.msg("No companies", cid)
             return
         
         lines = ["=== Company Values ==="]
-        for i, (co_id, data) in enumerate(sorted(self.companies.items(), key=lambda x: x[1]['value'], reverse=True)[:10], 1):
-            name = data.get('name', f"Company {co_id}")
-            value = self._fmt(data.get('value', 0))
+        sorted_cos = sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10]
+        
+        for i, (game_id, data) in enumerate(sorted_cos, 1):
+            name = data.get('name', f'Company {game_id}')
+            value = self.fmt(data.get('value', 0))
             lines.append(f"{i}. {name}: {value}")
         
-        await self._send_msg('\n'.join(lines), cid)
+        await self.msg('\n'.join(lines), cid)
     
-    async def _handle_reset_command(self, cid: int):
-        client = await self._refresh_client(cid) or self.clients.get(cid)
-
-        if not client or client.get('company') == 255:
-            await self._send_msg("Must be in company to reset", cid)
+    async def handle_reset(self, cid: int):
+        client = self.clients.get(cid)
+        if not client or client.get('company_id') == 255:
+            await self.msg("Must be in a company to reset", cid)
             return
-
-        co_id = client['company']
-        self.reset_pending[cid] = co_id
-        msg = f"=== Reset Company {co_id} ===\nThis DELETES your company!\nType !yes to confirm (10s timeout)"
-        await self._send_msg(msg, cid)
         
-        async def _expire():
+        company_id = client['company_id']
+        self.reset_pending[cid] = company_id
+        await self.msg(
+            f"=== Reset Company #{company_id} ===\n"
+            f"This DELETES your company!\n"
+            f"Type !yes to confirm (10s timeout)",
+            cid
+        )
+        
+        async def expire():
             await asyncio.sleep(10)
             self.reset_pending.pop(cid, None)
-        asyncio.create_task(_expire())
-
-    async def _refresh_client(self, cid: int):
-        return self.clients.get(cid)
+        asyncio.create_task(expire())
     
-    async def _confirm_reset(self, cid: int):
+    async def confirm_reset(self, cid: int):
         if cid not in self.reset_pending:
             return
         
-        co_id = self.reset_pending.pop(cid)
-
-        client = await self._refresh_client(cid)
-        if not client or client.get('company') not in (co_id, 255):
-            await self._send_msg("Reset cancelled; your company changed.", cid)
-            return
-
-        await self.admin.send_rcon(f"move {cid} 255")
-
-        moved = await self._ensure_spectator(cid)
-        if not moved:
-            await self._send_msg("Could not move you to spectators; reset cancelled.", cid)
-            return
-
-        await self.admin.send_rcon(f"reset_company {co_id}")
-        self.companies.pop(co_id, None)
-        await self._send_msg(f"Company {co_id} reset", cid)
-        await self._sync_pause_state()
-
-    async def _ensure_spectator(self, cid: int) -> bool:
+        company_id = self.reset_pending.pop(cid)
         client = self.clients.get(cid)
-        return client and client.get('company') == 255
+        
+        if not client or client.get('company_id') not in (company_id, 255):
+            await self.msg("Reset cancelled (company changed)", cid)
+            return
+        
+        game_client_id = cid + 1
+        await self.admin.rcon(f"move {game_client_id} 255")
+        await asyncio.sleep(0.2)
+        
+        if self.clients.get(cid, {}).get('company_id') != 255:
+            await self.msg("Could not move to spectators", cid)
+            return
+        
+        await self.admin.rcon(f"reset_company {company_id}")
+        self.companies.pop(company_id, None)
+        await self.msg(f"Company #{company_id} reset", cid)
+        await self.sync_pause()
     
-    async def _send_msg(self, msg: str, cid: int = None):
-        try:
-            lines = msg.split('\n')
-            for line in lines:
-                if not line.strip():
-                    continue
-                    
-                if cid:
-                    self.logger.info(f"[ADMIN] To Client {cid}: {line}")
-                    await self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
-                                   desttype=openttdpacket.ChatDestTypes.CLIENT, id=cid)
-                else:
-                    self.logger.info(f"[ADMIN] Broadcast: {line}")
-                    await self.admin._chat(line, action=openttdpacket.Actions.SERVER_MESSAGE,
-                                   desttype=openttdpacket.ChatDestTypes.BROADCAST)
-                
-                await asyncio.sleep(0.1)
-        except:
-            pass
+    async def msg(self, text: str, cid: int = None):
+        """Send message to client or broadcast"""
+        for line in text.split('\n'):
+            if not line.strip():
+                continue
+            
+            if cid:
+                await self.admin.chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT, cid)
+            else:
+                await self.admin.chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.BROADCAST)
+            
+            await asyncio.sleep(0.1)
     
-    async def _broadcast(self, msg: str):
-        await self._send_msg(msg)
+    async def broadcast(self, text: str):
+        await self.msg(text)
     
-    def _get_current_year(self) -> int:
-        if self.game_date is not None:
-            return (date(1, 1, 1) + timedelta(days=self.game_date)).year - 1
-        return 1950
-
-    def _fmt_date(self, day_count: int) -> str:
-        d = date(1, 1, 1) + timedelta(days=day_count - 1)
-        return d.strftime("%m-%d-%Y")
-    
-    def _fmt(self, val: int) -> str:
+    def fmt(self, val: int) -> str:
+        """Format large numbers"""
         if val >= 1_000_000_000:
-            return f"{val / 1_000_000_000:.1f}b"
+            return f"{val/1_000_000_000:.1f}b"
         if val >= 1_000_000:
-            return f"{val / 1_000_000:.1f}m"
+            return f"{val/1_000_000:.1f}m"
         if val >= 1_000:
-            return f"{val / 1_000:.1f}k"
+            return f"{val/1_000:.1f}k"
         return str(val)
 
 def load_settings(path: str = "settings.json") -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        root_logger.error("settings.json not found at %s", path)
-        raise
-    except json.JSONDecodeError as e:
-        root_logger.error("settings.json is invalid JSON: %s", e)
-        raise
+    with open(path, "r") as f:
+        return json.load(f)
 
-async def load_settings_async(path: str = "settings.json") -> dict:
-    return await asyncio.to_thread(load_settings, path)
-
-def build_server_configs(settings: dict) -> list:
-    admin_ports = settings.get("admin_ports") or []
-    configs = []
-    for admin_port in admin_ports:
-        cfg = Config(
-            admin_port=admin_port,
-            server_ip=settings.get("server_ip"),
-            admin_name=settings.get("admin_name"),
-            admin_pass=settings.get("admin_pass"),
-            goal_value=settings.get("goal_value"),
-            load_scenario=settings.get("load_scenario"),
-            dead_co_age=settings.get("dead_co_age"),
-            dead_co_value=settings.get("dead_co_value"),
-            reset_countdown_seconds=settings.get("reset_countdown_seconds"),
+def build_configs(settings: dict) -> list[Config]:
+    return [
+        Config(
+            admin_port=port,
+            server_ip=settings["server_ip"],
+            admin_name=settings["admin_name"],
+            admin_pass=settings["admin_pass"],
+            goal_value=settings["goal_value"],
+            load_scenario=settings["load_scenario"],
+            dead_co_age=settings["dead_co_age"],
+            dead_co_value=settings["dead_co_value"],
         )
-        configs.append(cfg)
-    return configs
+        for port in settings.get("admin_ports", [])
+    ]
 
-def signal_handler(signum: int, frame) -> None:
-    root_logger.info("Received signal %d, shutting down...", signum)
-    for bot in _running_bots:
-        bot.stop_event.set()
+_bots = []
+
+def signal_handler(sig, frame):
+    root_logger.info("Shutting down...")
+    for bot in _bots:
+        bot.stop.set()
     sys.exit(0)
 
-_running_bots = []
-
-async def main() -> None:
-    settings = await load_settings_async()
-    servers = build_server_configs(settings)
-
+async def main():
+    settings = load_settings()
+    configs = build_configs(settings)
+    
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
-
+    
     root_logger.info('=== OpenTTD Admin Bot Starting ===')
     
     tasks = []
-    for cfg in servers:
-        bot = AsyncRconBot(cfg)
-        _running_bots.append(bot)
+    for cfg in configs:
+        bot = Bot(cfg)
+        _bots.append(bot)
         tasks.append(asyncio.create_task(bot.start()))
     
     await asyncio.gather(*tasks)
