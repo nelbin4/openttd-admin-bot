@@ -4,11 +4,15 @@ import signal
 import sys
 import asyncio
 from dataclasses import dataclass
-from datetime import date, timedelta, datetime
+from datetime import timedelta, datetime
 
 from aiopyopenttdadmin import Admin as AsyncAdmin
 from pyopenttdadmin import openttdpacket, AdminUpdateType, AdminUpdateFrequency
-from pyopenttdadmin.enums import *
+from pyopenttdadmin.enums import Actions, ChatDestTypes, PacketType
+
+SPECTATOR_ID = 255
+POLL_ALL_CLIENTS = 0xFFFFFFFF
+MAX_COMPANIES = 16
 
 @dataclass
 class Config:
@@ -21,10 +25,29 @@ class Config:
     dead_co_age: int
     dead_co_value: int
 
+
+class AdminPollPacket(openttdpacket.Packet):
+    packet_type = PacketType.ADMIN_POLL
+
+    def __init__(self, update_type: int, data: int):
+        self.update_type = update_type
+        self.data = data
+
+    def to_bytes(self) -> bytes:
+        return self.update_type.to_bytes(1, 'little') + self.data.to_bytes(4, 'little')
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
 
 class Bot:
+    COMMAND_HANDLERS = {
+        "help": "cmd_help",
+        "info": "cmd_info",
+        "rules": "cmd_rules",
+        "cv": "cmd_cv",
+        "reset": "cmd_reset",
+    }
+
     # Init & utilities
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -38,6 +61,16 @@ class Bot:
         self.goal_reached = False
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
+
+    def _reset_state(self):
+        self.companies.clear()
+        self.clients.clear()
+        self.game_date = None
+        self.goal_reached = False
+        self.paused = None
+        for _, task in self.reset_pending.values():
+            task.cancel()
+        self.reset_pending.clear()
 
     def _cancel_reset_pending(self, cid: int):
         entry = self.reset_pending.pop(cid, None)
@@ -54,7 +87,7 @@ class Bot:
                 await asyncio.sleep(10)
                 if cid in self.reset_pending:
                     self.reset_pending.pop(cid, None)
-                    await self.msg("Reset cancelled (timeout)", cid)
+                    await self.send_lines("Reset cancelled (timeout)", cid)
             except asyncio.CancelledError:
                 pass
 
@@ -62,15 +95,12 @@ class Bot:
         self.reset_pending[cid] = (company_id, task)
 
     def normalize_company_id(self, cid_raw: int) -> int:
-        return 255 if cid_raw == 255 else cid_raw + 1
+        return SPECTATOR_ID if cid_raw == SPECTATOR_ID else cid_raw + 1
 
     def fmt(self, val: int) -> str:
-        if val >= 1_000_000_000:
-            return f"{val/1_000_000_000:.1f}b"
-        if val >= 1_000_000:
-            return f"{val/1_000_000:.1f}m"
-        if val >= 1_000:
-            return f"{val/1_000:.1f}k"
+        for threshold, suffix in ((1_000_000_000, 'b'), (1_000_000, 'm'), (1_000, 'k')):
+            if val >= threshold:
+                return f"{val / threshold:.1f}{suffix}"
         return str(val)
 
     async def wait_or_stop(self, timeout: float) -> bool:
@@ -80,10 +110,17 @@ class Bot:
         except asyncio.TimeoutError:
             return False
 
-    async def _send_lines(self, text: str, cid: int | None = None):
+    def _game_year(self) -> int | None:
+        if self.game_date is None:
+            return None
+        return self.game_date // 365
+
+    async def send_lines(self, text: str, cid: int | None = None):
         for line in text.split('\n'):
             if line.strip():
-                await self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT if cid else ChatDestTypes.BROADCAST, cid or 0)
+                dest = ChatDestTypes.CLIENT if cid is not None else ChatDestTypes.BROADCAST
+                target = cid if cid is not None else 0
+                await self.admin._chat(line, Actions.SERVER_MESSAGE, dest, target)
                 await asyncio.sleep(0.1)
 
     # Connection lifecycle
@@ -110,6 +147,7 @@ class Bot:
     async def run_bot(self):
         bg_tasks: list[asyncio.Task] = []
         try:
+            self._reset_state()
             async with AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port) as admin:
                 self.admin = admin
                 await admin.login(self.cfg.admin_name, self.cfg.admin_pass)
@@ -118,7 +156,7 @@ class Bot:
                 await admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
                 await admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
                 await admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
-                await admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.WEEKLY)
+                await admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.MONTHLY)
 
                 self.setup_handlers()
                 await self.poll_all()
@@ -126,12 +164,16 @@ class Bot:
                     asyncio.create_task(self.economy_loop()),
                     asyncio.create_task(self.hourly_cv_loop()),
                 ]
-                await self.broadcast("Admin connected")
+                await self.send_lines("Admin connected")
 
                 while not self.stop.is_set():
                     try:
-                        for packet in await admin.recv():
+                        packets = await admin.recv()
+                        for packet in packets:
                             await admin.handle_packet(packet)
+                        if self.admin and self.admin._reader and self.admin._reader.at_eof():
+                            self.log.warning("Connection closed by server")
+                            break
                     except Exception as e:
                         self.log.error(f"Packet handling error: {e}")
                         break
@@ -149,10 +191,7 @@ class Bot:
     async def poll(self, update_type: int, data: int):
         if not self.admin:
             return
-        payload = update_type.to_bytes(1, 'little') + data.to_bytes(4, 'little')
-        packet = (3 + len(payload)).to_bytes(2, 'little') + (3).to_bytes(1, 'little') + payload
-        self.admin._writer.write(packet)
-        await self.admin._writer.drain()
+        await self.admin._send(AdminPollPacket(update_type, data))
 
     async def poll_updates(self, update_types: list[int], ids: list[int]):
         for i in ids:
@@ -161,104 +200,102 @@ class Bot:
 
     async def poll_all(self):
         await self.poll_updates([AdminUpdateType.DATE.value], [0])
-        await self.poll_updates([AdminUpdateType.CLIENT_INFO.value], [0xFFFFFFFF])
+        await self.poll_updates([AdminUpdateType.CLIENT_INFO.value], [POLL_ALL_CLIENTS])
         await self.poll_updates([
             AdminUpdateType.COMPANY_INFO.value,
             AdminUpdateType.COMPANY_ECONOMY.value,
-        ], list(range(0, 16)))
+        ], list(range(0, MAX_COMPANIES)))
         await asyncio.sleep(0.5)
 
     async def poll_economy(self):
-        await self.poll_updates([AdminUpdateType.COMPANY_ECONOMY.value], list(range(0, 16)))
+        await self.poll_updates([AdminUpdateType.COMPANY_ECONOMY.value], list(range(0, MAX_COMPANIES)))
         await asyncio.sleep(0.3)
 
     async def poll_clients(self):
-        await self.poll_updates([AdminUpdateType.CLIENT_INFO.value], [0xFFFFFFFF])
+        await self.poll_updates([AdminUpdateType.CLIENT_INFO.value], [POLL_ALL_CLIENTS])
         await asyncio.sleep(0.2)
 
     # Handler wiring
     def setup_handlers(self):
-        def register(name: str, *packet_types: type):
-            def decorator(fn):
-                async def wrapped(admin, pkt):
-                    try:
-                        await fn(admin, pkt)
-                    except Exception as e:
-                        self.log.error(f"{name} handler error: {e}")
-                self.admin.add_handler(*packet_types)(wrapped)
-                return wrapped
-            return decorator
+        handlers = {
+            openttdpacket.ChatPacket: self._on_chat,
+            openttdpacket.DatePacket: self._on_date,
+            openttdpacket.CompanyInfoPacket: self._on_company_info,
+            openttdpacket.CompanyEconomyPacket: self._on_company_economy,
+            openttdpacket.ClientInfoPacket: self._on_client_info,
+            openttdpacket.CompanyUpdatePacket: self._on_company_update,
+            openttdpacket.ClientUpdatePacket: self._on_client_update,
+            openttdpacket.ClientQuitPacket: self._on_client_remove,
+            openttdpacket.ClientErrorPacket: self._on_client_remove,
+            openttdpacket.CompanyRemovePacket: self._on_company_remove,
+            openttdpacket.NewGamePacket: self._on_new_game,
+            openttdpacket.ShutdownPacket: self._on_shutdown,
+        }
+        for pkt_type, handler in handlers.items():
+            async def wrapped(admin, pkt, fn=handler, name=pkt_type.__name__):
+                try:
+                    await fn(pkt)
+                except Exception as exc:
+                    self.log.error(f"{name} handler error: {exc}")
+            self.admin.add_handler(pkt_type)(wrapped)
 
-        @register("chat", openttdpacket.ChatPacket)
-        async def on_chat(admin, pkt):
-            if pkt.message.strip().startswith('!'):
-                await self.handle_command(pkt.id, pkt.message.strip()[1:])
+    async def _on_chat(self, pkt):
+        if pkt.message.strip().startswith('!'):
+            await self.handle_command(pkt.id, pkt.message.strip()[1:])
 
-        @register("date", openttdpacket.DatePacket)
-        async def on_date(admin, pkt):
-            self.game_date = pkt.date
+    async def _on_date(self, pkt):
+        self.game_date = pkt.date
 
-        @register("company_info", openttdpacket.CompanyInfoPacket)
-        async def on_company_info(admin, pkt):
-            cid = self.normalize_company_id(pkt.id)
-            self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
-            self.paused = False
+    async def _on_company_info(self, pkt):
+        cid = self.normalize_company_id(pkt.id)
+        existing = self.companies.get(cid, {})
+        existing.update({'name': pkt.name, 'founded': pkt.year})
+        existing.setdefault('value', 0)
+        self.companies[cid] = existing
 
-        @register("company_economy", openttdpacket.CompanyEconomyPacket)
-        async def on_company_economy(admin, pkt):
-            cid = self.normalize_company_id(pkt.id)
-            if pkt.quarterly_info and cid in self.companies:
-                self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
+    async def _on_company_economy(self, pkt):
+        cid = self.normalize_company_id(pkt.id)
+        if pkt.quarterly_info and cid in self.companies:
+            self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
 
-        @register("client_info", openttdpacket.ClientInfoPacket)
-        async def on_client_info(admin, pkt):
-            cid = self.normalize_company_id(pkt.company_id)
-            if pkt.name != "<invalid>":
-                self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
+    async def _on_client_info(self, pkt):
+        cid = self.normalize_company_id(pkt.company_id)
+        if pkt.name != "<invalid>":
+            self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
 
-        @register("company_update", openttdpacket.CompanyUpdatePacket)
-        async def on_company_update(admin, pkt):
-            cid = self.normalize_company_id(pkt.id)
-            if cid not in self.companies:
-                self.companies[cid] = {'value': 0}
-            self.companies[cid]['name'] = pkt.name
+    async def _on_company_update(self, pkt):
+        cid = self.normalize_company_id(pkt.id)
+        if cid not in self.companies:
+            current_year = self._game_year()
+            self.companies[cid] = {'value': 0, 'founded': current_year}
+        self.companies[cid]['name'] = pkt.name
 
-        @register("client_update", openttdpacket.ClientUpdatePacket)
-        async def on_client_update(admin, pkt):
-            cid = self.normalize_company_id(pkt.company_id)
-            if pkt.id in self.clients:
-                self.clients[pkt.id]['company_id'] = cid
+    async def _on_client_update(self, pkt):
+        cid = self.normalize_company_id(pkt.company_id)
+        if pkt.id in self.clients:
+            self.clients[pkt.id]['company_id'] = cid
+            self.clients[pkt.id]['name'] = pkt.name
 
-            if pkt.id in self.reset_pending and cid == 255:
-                company_id, _ = self.reset_pending.pop(pkt.id)
-                await self.admin.send_rcon(f"reset_company {company_id}")
-                await self.msg(f"Company #{company_id} reset", pkt.id)
+        if pkt.id in self.reset_pending and cid == SPECTATOR_ID:
+            company_id, task = self.reset_pending.pop(pkt.id)
+            task.cancel()
+            await self.admin.send_rcon(f"reset_company {company_id}")
+            await self.send_lines(f"Company #{company_id} reset", pkt.id)
 
-        @register("client_remove", openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
-        async def on_client_remove(admin, pkt):
-            self.clients.pop(pkt.id, None)
-            self._cancel_reset_pending(pkt.id)
+    async def _on_client_remove(self, pkt):
+        self.clients.pop(pkt.id, None)
+        self._cancel_reset_pending(pkt.id)
 
-        @register("company_remove", openttdpacket.CompanyRemovePacket)
-        async def on_company_remove(admin, pkt):
-            cid = self.normalize_company_id(pkt.id)
-            self.companies.pop(cid, None)
+    async def _on_company_remove(self, pkt):
+        cid = self.normalize_company_id(pkt.id)
+        self.companies.pop(cid, None)
 
-        @register("new_game", openttdpacket.NewGamePacket)
-        async def on_new_game(admin, pkt):
-            for _, task in self.reset_pending.values():
-                task.cancel()
-            self.reset_pending.clear()
-            self.companies.clear()
-            self.clients.clear()
-            self.game_date = None
-            self.goal_reached = False
-            self.paused = None
-            await self.poll_all()
+    async def _on_new_game(self, _pkt):
+        self._reset_state()
+        await self.poll_all()
 
-        @register("shutdown", openttdpacket.ShutdownPacket)
-        async def on_shutdown(admin, pkt):
-            self.stop.set()
+    async def _on_shutdown(self, _pkt):
+        self.stop.set()
 
     # Loops & state checks
     async def economy_loop(self):
@@ -288,13 +325,13 @@ class Bot:
             value = data.get('value', 0)
             if value >= self.cfg.goal_value:
                 self.goal_reached = True
-                winner_name = data['name']
+                winner_name = data.get('name', 'Unknown')
                 self.log.info(f"Goal reached: {winner_name} with {self.fmt(value)}")
 
-                await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)} company value!")
+                await self.send_lines(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)} company value!")
 
-                for delay, msg in [(20, "Map resets in 20s..."), (10, "Map resets in 10s..."), (5, "Map resets in 5s...")]:
-                    await self.broadcast(msg)
+                for delay, msg in [(10, "Map resets in 20s..."), (5, "Map resets in 10s..."), (5, "Map resets in 5s...")]:
+                    await self.send_lines(msg)
                     try:
                         await asyncio.wait_for(self.stop.wait(), timeout=delay)
                         return
@@ -302,41 +339,36 @@ class Bot:
                         pass
 
                 await self.admin.send_rcon(f"load {self.cfg.load_scenario}")
-                self.companies.clear()
-                self.clients.clear()
-                self.goal_reached = False
-                await self.poll_all()
                 break
 
     async def check_dead_companies(self):
-        if not self.game_date:
+        if self.game_date is None:
             return
-        year = (date(1, 1, 1) + timedelta(days=self.game_date)).year - 1
+        year = self._game_year()
+        if year is None:
+            return
         for cid, data in list(self.companies.items()):
-            age = year - data.get('founded', 1950)
+            founded = data.get('founded')
+            if founded is None:
+                continue
+            age = year - founded
             if age >= self.cfg.dead_co_age and data.get('value', 0) < self.cfg.dead_co_value:
                 for client_id, client in list(self.clients.items()):
                     if client.get('company_id') == cid:
-                        await self.admin.send_rcon(f"move {client_id} 255")
+                        await self.admin.send_rcon(f"move {client_id} {SPECTATOR_ID}")
                 await self.admin.send_rcon(f"reset_company {cid}")
-                await self.broadcast(f"Inactive company {data.get('name', 'Unknown')} auto-reset")
+                await self.send_lines(f"Inactive company {data.get('name', 'Unknown')} auto-reset")
 
     async def hourly_cv_loop(self):
         while not self.stop.is_set():
             now = datetime.now()
             target = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-            while not self.stop.is_set():
-                remaining = (target - datetime.now()).total_seconds()
-                if remaining <= 0:
-                    break
-                if await self.wait_or_stop(min(remaining, 30)):
-                    break
-            if self.stop.is_set():
+            remaining = (target - datetime.now()).total_seconds()
+            if await self.wait_or_stop(max(remaining, 0)):
                 break
             try:
-                await self.poll_economy()
                 lines = self.build_cv_lines()
-                await self.broadcast('\n'.join(lines))
+                await self.send_lines('\n'.join(lines))
             except Exception as e:
                 self.log.error(f"Hourly CV loop error: {e}")
 
@@ -361,51 +393,36 @@ class Bot:
         if not parts:
             return
 
-        commands = {
-            'help': self.cmd_help,
-            'info': self.cmd_info,
-            'rules': self.cmd_rules,
-            'cv': self.cmd_cv,
-            'reset': self.cmd_reset,
-        }
-        handler = commands.get(parts[0].lower())
-        if handler:
-            await handler(cid)
-
-    async def msg(self, text: str, cid: int | None = None):
-        await self._send_lines(text, cid)
-
-    async def broadcast(self, text: str):
-        await self._send_lines(text)
+        handler_name = self.COMMAND_HANDLERS.get(parts[0].lower())
+        if handler_name:
+            await getattr(self, handler_name)(cid)
 
     async def cmd_help(self, cid: int):
-        await self._send_lines("=== Chat Commands ===\n!info, !rules, !cv, !reset", cid)
+        await self.send_lines("=== Chat Commands ===\n!info, !rules, !cv, !reset", cid)
 
     async def cmd_info(self, cid: int):
-        await self._send_lines(
+        await self.send_lines(
             f"=== Game Info ===\nGoal: first company to reach {self.fmt(self.cfg.goal_value)} wins\nGamescript: Production Booster\nTransport >70% increases <50% decreases",
             cid,
         )
 
     async def cmd_rules(self, cid: int):
-        await self._send_lines(
+        await self.send_lines(
             f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5. Inactive companies (>{self.cfg.dead_co_age}yrs & cv <{self.fmt(self.cfg.dead_co_value)}) auto-reset",
             cid,
         )
 
     async def cmd_cv(self, cid: int):
-        await self.poll_economy()
-        await self._send_lines('\n'.join(self.build_cv_lines()), cid)
+        await self.send_lines('\n'.join(self.build_cv_lines()), cid)
 
     async def cmd_reset(self, cid: int):
-        await self.poll_clients()
         client = self.clients.get(cid)
-        if not client or client.get('company_id') == 255:
-            await self._send_lines("Must be in a company to reset", cid)
+        if not client or client.get('company_id') == SPECTATOR_ID:
+            await self.send_lines("Must be in a company to reset", cid)
             return
         company_id = client['company_id']
         self._set_reset_pending(cid, company_id)
-        await self._send_lines("Move to spectator within 10s to reset", cid)
+        await self.send_lines("Move to spectator within 10s to reset", cid)
 
 
 def load_settings(path: str = "settings.json") -> dict:
@@ -426,15 +443,6 @@ def build_configs(settings: dict) -> list[Config]:
     ) for port in settings.get("admin_ports", [])]
 
 
-_bots = []
-
-
-def signal_handler(sig, frame):
-    for bot in _bots:
-        bot.stop.set()
-    sys.exit(0)
-
-
 async def main():
     settings = load_settings()
     configs = build_configs(settings)
@@ -451,16 +459,26 @@ async def main():
             root_logger.error(f"Invalid dead_co_age for port {cfg.admin_port}")
             sys.exit(1)
     
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    loop = asyncio.get_running_loop()
+    bots: list[Bot] = []
+
+    def stop_bots():
+        for bot in bots:
+            bot.stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_bots)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: stop_bots())
     root_logger.info('=== OpenTTD Admin Bot Starting ===')
     
     tasks = []
     for cfg in configs:
         bot = Bot(cfg)
-        _bots.append(bot)
+        bots.append(bot)
         tasks.append(asyncio.create_task(bot.start()))
-    
+
     await asyncio.gather(*tasks)
 
 
