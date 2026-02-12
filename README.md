@@ -12,28 +12,25 @@
 
 ## Highlights
 
-- **Auto pause/unpause** when the map is empty; instant unpause on first active company.
-- **Goal tracking**: watches top company value, announces winner → countdown → loads new scenario.
-- **Dead company cleanup**: resets aged/low-value companies.
-- **Player self-service**: `!reset` + `!yes` for company reset request.
-- **Startup hygiene**: removes default “Unnamed” company; greets joiners.
-- **RCON safety**: serialized calls, retries, circuit breaker, buffered responses.
-- **Caching & speed**: TTL-based company/client caches with periodic refresh and backoff.
-- **Resilience**: reconnect attempts, thread pool workers, memory/log visibility.
+- **Auto pause/unpause** pauses when no company; unpause when there is one.
+- **Goal tracking**: watches top company value, announces winner → loads new map.
+- **Dead company cleanup**: automatically resets aged/low-value companies.
+- **Player self-service**: `!reset` + `moving to spectator` for company reset request.
+- **Startup hygiene**: removes “Unnamed” company; default company for scenario maps.
 
 ## Files & entrypoints
 
 | File                | Purpose                                                                   |
 | ----------------    | -------------------------------------                                     |
-| `main.py`           | Main entry point (reads `settings.json`; supports many servers; practical limit depends on hardware). |
-| `settings.json`     | Multi-server config: admin ports (optional game_ports must match length), credentials, scenario, thresholds. |
+| `main.py`           | Main entry point (reads `settings.json`; supports many servers. |
+| `settings.json`     | Multi-server config: admin ports, credentials, scenario, thresholds. |
 | `requirements.txt`  | Python dependencies (primary: `pyOpenTTDAdmin`).                          |
 
 ## Requirements
 
 - OpenTTD ≥ 15.x with **admin port open** (TCP 3977 default)
 - Python **3.10 – 3.13**
-- Access to your scenario file on the server (e.g., `content_download/scenario`)
+- Upload your scenario file on the server (folder `scenario`)
 
 ## Configuration
 
@@ -50,11 +47,6 @@ Set values inside `settings.json`. `main.py` reads arrays of ports and will star
   "goal_value": 10000000000,
   "dead_co_age": 5,                 // years before auto-clean policy
   "dead_co_value": 5000000,         // autoclean threshhold company value
-  "rcon_retry_max": 3,
-  "rcon_retry_delay": 0.5,
-  "reconnect_max_attempts": 10,
-  "reconnect_delay": 5.0,
-  "reset_countdown_seconds": 20       // seconds to load scenario map when goal achieved
 }
 ```
 
@@ -67,7 +59,6 @@ Command | Action
 `!rules`   | Basic server rules
 `!cv`      | Top 10 company values + % to goal
 `!reset`   | Request to delete your current company
-`!yes`     | Confirm deletion (30s timeout), used when !reset
 
 ## Run locally
 
@@ -110,11 +101,8 @@ For single server inside Docker, change the CMD to `main.py`.
 
 ## Operational notes
 
-- `load_scenario` must exist on the OpenTTD host.
+- `load_scenario` if you want to load your prefered map.
 - Use a **strong admin password**—possession grants full control.
-- At startup, bot trims "Unnamed" company and pauses idle map. Auto unpause when company is created.
-- "Unnamed" company is generated when scenario map is used on a multiplayer game.
-- Goal handling: winner announcement → start reset countdown (default: 20s) → scenario load → state reset.
 
 ## License
 
