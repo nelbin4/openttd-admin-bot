@@ -4,12 +4,11 @@ import signal
 import sys
 import asyncio
 from dataclasses import dataclass
-from datetime import date, timedelta, datetime, timezone
+from datetime import date, timedelta, datetime
 
 from aiopyopenttdadmin import Admin as AsyncAdmin
 from pyopenttdadmin import openttdpacket, AdminUpdateType, AdminUpdateFrequency
 from pyopenttdadmin.enums import *
-
 
 @dataclass
 class Config:
@@ -22,10 +21,8 @@ class Config:
     dead_co_age: int
     dead_co_value: int
 
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 root_logger = logging.getLogger("OpenTTDBot")
-
 
 class Bot:
     # Init & utilities
@@ -42,11 +39,30 @@ class Bot:
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
 
-        self.max_reconnect_attempts = 10
-        self.reconnect_delay = 5.0
-
     def normalize_company_id(self, cid_raw: int) -> int:
         return 255 if cid_raw == 255 else cid_raw + 1
+
+    async def _send_lines(self, text: str, cid: int | None = None):
+        for line in text.split('\n'):
+            if line.strip():
+                await self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT if cid else ChatDestTypes.BROADCAST, cid or 0)
+                await asyncio.sleep(0.1)
+
+    def _set_reset_pending(self, cid: int, company_id: int):
+        async def expire():
+            await asyncio.sleep(10)
+            if cid in self.reset_pending:
+                self.reset_pending.pop(cid, None)
+                await self.msg("Reset cancelled", cid)
+
+        timeout_task = asyncio.create_task(expire())
+        self.reset_pending[cid] = (company_id, timeout_task)
+
+    def _cancel_reset_pending(self, cid: int):
+        entry = self.reset_pending.pop(cid, None)
+        if entry:
+            _, timeout_task = entry
+            timeout_task.cancel()
 
     def fmt(self, val: int) -> str:
         if val >= 1_000_000_000:
@@ -60,7 +76,7 @@ class Bot:
     # Connection lifecycle
     async def start(self):
         attempt = 0
-        while not self.stop.is_set() and attempt < self.max_reconnect_attempts:
+        while not self.stop.is_set() and attempt < 10:
             try:
                 await self.run_bot()
                 break
@@ -68,12 +84,12 @@ class Bot:
                 attempt += 1
                 self.log.error(f"Connection error: {e}")
 
-                if attempt >= self.max_reconnect_attempts:
+                if attempt >= 10:
                     self.log.error("Max reconnection attempts reached")
                     break
 
-                delay = min(self.reconnect_delay * (2 ** (attempt - 1)), 300)
-                self.log.info(f"Reconnecting in {delay}s (attempt {attempt}/{self.max_reconnect_attempts})...")
+                delay = min(5.0 * (2 ** (attempt - 1)), 300)
+                self.log.info(f"Reconnecting in {delay}s (attempt {attempt}/10)...")
                 await asyncio.sleep(delay)
 
         self.log.info("Bot stopped")
@@ -114,12 +130,15 @@ class Bot:
         self.admin._writer.write(packet)
         await self.admin._writer.drain()
 
-    async def poll_all(self):
-        await self.poll(AdminUpdateType.DATE.value, 0)
-        await self.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+    async def poll_companies(self):
         for i in range(16):
             await self.poll(AdminUpdateType.COMPANY_INFO.value, i)
             await self.poll(AdminUpdateType.COMPANY_ECONOMY.value, i)
+
+    async def poll_all(self):
+        await self.poll(AdminUpdateType.DATE.value, 0)
+        await self.poll(AdminUpdateType.CLIENT_INFO.value, 0xFFFFFFFF)
+        await self.poll_companies()
         await asyncio.sleep(0.5)
 
     async def poll_economy(self):
@@ -133,102 +152,83 @@ class Bot:
 
     # Handler wiring
     def setup_handlers(self):
-        @self.admin.add_handler(openttdpacket.ChatPacket)
+        def register(name: str, *packet_types: type):
+            def decorator(fn):
+                async def wrapped(admin, pkt):
+                    try:
+                        await fn(admin, pkt)
+                    except Exception as e:
+                        self.log.error(f"{name} handler error: {e}")
+                self.admin.add_handler(*packet_types)(wrapped)
+                return wrapped
+            return decorator
+
+        @register("chat", openttdpacket.ChatPacket)
         async def on_chat(admin, pkt):
-            try:
-                if pkt.message.strip().startswith('!'):
-                    await self.handle_command(pkt.id, pkt.message.strip()[1:])
-            except Exception as e:
-                self.log.error(f"Chat handler error: {e}")
+            if pkt.message.strip().startswith('!'):
+                await self.handle_command(pkt.id, pkt.message.strip()[1:])
 
-        @self.admin.add_handler(openttdpacket.DatePacket)
+        @register("date", openttdpacket.DatePacket)
         async def on_date(admin, pkt):
-            try:
-                self.game_date = pkt.date
-            except Exception as e:
-                self.log.error(f"Date handler error: {e}")
+            self.game_date = pkt.date
 
-        @self.admin.add_handler(openttdpacket.CompanyInfoPacket)
+        @register("company_info", openttdpacket.CompanyInfoPacket)
         async def on_company_info(admin, pkt):
-            try:
-                cid = self.normalize_company_id(pkt.id)
-                self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
-                self.paused = False
-                await self.admin.send_rcon("unpause")
-            except Exception as e:
-                self.log.error(f"Company info handler error: {e}")
+            cid = self.normalize_company_id(pkt.id)
+            self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
+            self.paused = False
+            await self.admin.send_rcon("unpause")
 
-        @self.admin.add_handler(openttdpacket.CompanyEconomyPacket)
+        @register("company_economy", openttdpacket.CompanyEconomyPacket)
         async def on_company_economy(admin, pkt):
-            try:
-                cid = self.normalize_company_id(pkt.id)
-                if pkt.quarterly_info and cid in self.companies:
-                    self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
-            except Exception as e:
-                self.log.error(f"Company economy handler error: {e}")
+            cid = self.normalize_company_id(pkt.id)
+            if pkt.quarterly_info and cid in self.companies:
+                self.companies[cid]['value'] = pkt.quarterly_info[-1]['company_value']
 
-        @self.admin.add_handler(openttdpacket.ClientInfoPacket)
+        @register("client_info", openttdpacket.ClientInfoPacket)
         async def on_client_info(admin, pkt):
-            try:
-                cid = self.normalize_company_id(pkt.company_id)
-                if pkt.name != "<invalid>":
-                    self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
-            except Exception as e:
-                self.log.error(f"Client info handler error: {e}")
+            cid = self.normalize_company_id(pkt.company_id)
+            if pkt.name != "<invalid>":
+                self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
 
-        @self.admin.add_handler(openttdpacket.CompanyUpdatePacket)
+        @register("company_update", openttdpacket.CompanyUpdatePacket)
         async def on_company_update(admin, pkt):
             cid = 255 if pkt.id == 255 else pkt.id + 1
             if cid not in self.companies:
                 self.companies[cid] = {'value': 0}
             self.companies[cid]['name'] = pkt.name
 
-        @self.admin.add_handler(openttdpacket.ClientUpdatePacket)
+        @register("client_update", openttdpacket.ClientUpdatePacket)
         async def on_client_update(admin, pkt):
-            try:
-                cid = self.normalize_company_id(pkt.company_id)
-                if pkt.id in self.clients:
-                    self.clients[pkt.id]['company_id'] = cid
+            cid = self.normalize_company_id(pkt.company_id)
+            if pkt.id in self.clients:
+                self.clients[pkt.id]['company_id'] = cid
 
-                if pkt.id in self.reset_pending and cid == 255:
-                    company_id, timeout_task = self.reset_pending.pop(pkt.id)
-                    timeout_task.cancel()
-                    await self.admin.send_rcon(f"reset_company {company_id}")
-                    await self.msg(f"Company #{company_id} reset", pkt.id)
-            except Exception as e:
-                self.log.error(f"Client update handler error: {e}")
+            if pkt.id in self.reset_pending and cid == 255:
+                company_id, _ = self.reset_pending.pop(pkt.id)
+                await self.admin.send_rcon(f"reset_company {company_id}")
+                await self.msg(f"Company #{company_id} reset", pkt.id)
 
-        @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
+        @register("client_remove", openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         async def on_client_remove(admin, pkt):
-            try:
-                self.clients.pop(pkt.id, None)
-                if pkt.id in self.reset_pending:
-                    _, timeout_task = self.reset_pending.pop(pkt.id)
-                    timeout_task.cancel()
-            except Exception as e:
-                self.log.error(f"Client remove handler error: {e}")
+            self.clients.pop(pkt.id, None)
+            self._cancel_reset_pending(pkt.id)
 
-        @self.admin.add_handler(openttdpacket.CompanyRemovePacket)
+        @register("company_remove", openttdpacket.CompanyRemovePacket)
         async def on_company_remove(admin, pkt):
-            try:
-                cid = self.normalize_company_id(pkt.id)
-                self.companies.pop(cid, None)
-            except Exception as e:
-                self.log.error(f"Company remove handler error: {e}")
+            cid = self.normalize_company_id(pkt.id)
+            self.companies.pop(cid, None)
 
-        @self.admin.add_handler(openttdpacket.NewGamePacket)
+        @register("new_game", openttdpacket.NewGamePacket)
         async def on_new_game(admin, pkt):
-            try:
-                self.companies.clear()
-                self.clients.clear()
-                self.game_date = None
-                self.goal_reached = False
-                self.paused = None
-                await self.poll_all()
-            except Exception as e:
-                self.log.error(f"New game handler error: {e}")
+            self.companies.clear()
+            self.clients.clear()
+            self.game_date = None
+            self.goal_reached = False
+            self.paused = None
+            await self.poll_all()
 
-        @self.admin.add_handler(openttdpacket.ShutdownPacket)
+        @register("shutdown", openttdpacket.ShutdownPacket)
         async def on_shutdown(admin, pkt):
             self.stop.set()
 
@@ -238,6 +238,7 @@ class Bot:
             await asyncio.sleep(30)
             if self.stop.is_set():
                 break
+
             try:
                 await self.poll_economy()
                 await self.check_dead_companies()
@@ -354,22 +355,11 @@ class Bot:
                 await self.msg("Must be in a company to reset", cid)
             else:
                 company_id = client['company_id']
-
-                async def expire():
-                    await asyncio.sleep(10)
-                    if cid in self.reset_pending:
-                        self.reset_pending.pop(cid)
-                        await self.msg("Reset cancelled", cid)
-
-                timeout_task = asyncio.create_task(expire())
-                self.reset_pending[cid] = (company_id, timeout_task)
+                self._set_reset_pending(cid, company_id)
                 await self.msg(f"Move to spectator within 10s to reset", cid)
 
     async def msg(self, text: str, cid: int | None = None):
-        for line in text.split('\n'):
-            if line.strip():
-                await self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT if cid else ChatDestTypes.BROADCAST, cid or 0)
-                await asyncio.sleep(0.1)
+        await self._send_lines(text, cid)
 
     async def broadcast(self, text: str):
         await self.msg(text)
