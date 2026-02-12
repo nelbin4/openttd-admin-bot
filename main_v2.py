@@ -39,6 +39,28 @@ class Bot:
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
 
+    def _cancel_reset_pending(self, cid: int):
+        entry = self.reset_pending.pop(cid, None)
+        if entry:
+            _, task = entry
+            task.cancel()
+
+    def _set_reset_pending(self, cid: int, company_id: int):
+        # Cancel any existing pending reset for this client
+        self._cancel_reset_pending(cid)
+
+        async def timeout():
+            try:
+                await asyncio.sleep(10)
+                if cid in self.reset_pending:
+                    self.reset_pending.pop(cid, None)
+                    await self.msg("Reset cancelled (timeout)", cid)
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(timeout())
+        self.reset_pending[cid] = (company_id, task)
+
     def normalize_company_id(self, cid_raw: int) -> int:
         return 255 if cid_raw == 255 else cid_raw + 1
 
@@ -224,6 +246,9 @@ class Bot:
 
         @register("new_game", openttdpacket.NewGamePacket)
         async def on_new_game(admin, pkt):
+            for _, task in self.reset_pending.values():
+                task.cancel()
+            self.reset_pending.clear()
             self.companies.clear()
             self.clients.clear()
             self.game_date = None
