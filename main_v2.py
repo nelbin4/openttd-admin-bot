@@ -4,7 +4,7 @@ import signal
 import sys
 import asyncio
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 from aiopyopenttdadmin import Admin as AsyncAdmin
 from pyopenttdadmin import openttdpacket, AdminUpdateType, AdminUpdateFrequency
@@ -15,13 +15,11 @@ from pyopenttdadmin.enums import *
 class Config:
     admin_port: int
     server_ip: str
-    admin_name: str
     admin_pass: str
     goal_value: int
     load_scenario: str
     dead_co_age: int
     dead_co_value: int
-    reset_countdown_seconds: int
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,28 +40,36 @@ class Bot:
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
 
-    async def start(self):
-        self.admin = AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port)
-        await self.admin.login(self.cfg.admin_name, self.cfg.admin_pass)
-        
-        await self.admin.subscribe(AdminUpdateType.CHAT, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
-        await self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
-        await self.admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.WEEKLY)
-        
-        self.setup_handlers()
-        await self.poll_all()
-        asyncio.create_task(self.economy_loop())
-        await self.broadcast("Admin connected")
+    def normalize_company_id(self, pkt_id: int) -> int:
+        return 255 if pkt_id == 255 else pkt_id + 1
 
-        while not self.stop.is_set():
-            try:
-                for packet in await self.admin.recv():
-                    await self.admin.handle_packet(packet)
-            except Exception as e:
-                self.log.error(f"Error: {e}")
-            await asyncio.sleep(0.1)
+    async def start(self):
+        async with AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port) as admin:
+            self.admin = admin
+            await admin.login(self.cfg.admin_name, self.cfg.admin_pass)
+            
+            await admin.subscribe(AdminUpdateType.CHAT, AdminUpdateFrequency.AUTOMATIC)
+            await admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
+            await admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
+            await admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
+            await admin.subscribe(AdminUpdateType.COMPANY_ECONOMY, AdminUpdateFrequency.WEEKLY)
+            
+            self.setup_handlers()
+            await self.poll_all()
+            asyncio.create_task(self.economy_loop())
+            asyncio.create_task(self.hourly_cv_loop())
+            await self.broadcast("Admin connected")
+
+            while not self.stop.is_set():
+                try:
+                    for packet in await admin.recv():
+                        await admin.handle_packet(packet)
+                except Exception as e:
+                    self.log.error(f"Error: {e}")
+                await asyncio.sleep(0.1)
+            
+            self.log.info("Bot stopping, cleaning up connection...")
+        self.admin = None
 
     async def poll(self, update_type: int, data: int):
         payload = update_type.to_bytes(1, 'little') + data.to_bytes(4, 'little')
@@ -91,64 +97,91 @@ class Bot:
     def setup_handlers(self):
         @self.admin.add_handler(openttdpacket.ChatPacket)
         async def on_chat(admin, pkt):
-            if pkt.message.strip().startswith('!'):
-                await self.handle_command(pkt.id, pkt.message.strip()[1:])
+            try:
+                if pkt.message.strip().startswith('!'):
+                    await self.handle_command(pkt.id, pkt.message.strip()[1:])
+            except Exception as e:
+                self.log.error(f"Chat handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.DatePacket)
         async def on_date(admin, pkt):
-            self.game_date = pkt.date
+            try:
+                self.game_date = pkt.date
+            except Exception as e:
+                self.log.error(f"Date handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.CompanyInfoPacket)
         async def on_company_info(admin, pkt):
-            cid = 255 if pkt.id == 255 else pkt.id + 1
-            self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
-            self.paused = False
-            await self.admin.send_rcon("unpause")
+            try:
+                cid = self.normalize_company_id(pkt.id)
+                self.companies[cid] = {'name': pkt.name, 'founded': pkt.year, 'value': 0}
+                self.paused = False
+                await self.admin.send_rcon("unpause")
+            except Exception as e:
+                self.log.error(f"Company info handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.CompanyEconomyPacket)
         async def on_company_economy(admin, pkt):
-            cid = 255 if pkt.id == 255 else pkt.id + 1
-            if pkt.quarterly_info and cid in self.companies:
-                self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
+            try:
+                cid = self.normalize_company_id(pkt.id)
+                if pkt.quarterly_info and cid in self.companies:
+                    self.companies[cid]['value'] = pkt.quarterly_info[0]['company_value']
+            except Exception as e:
+                self.log.error(f"Company economy handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.ClientInfoPacket)
         async def on_client_info(admin, pkt):
-            cid = 255 if pkt.company_id == 255 else pkt.company_id + 1
-            if pkt.name != "<invalid>":
-                self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
+            try:
+                cid = self.normalize_company_id(pkt.company_id)
+                if pkt.name != "<invalid>":
+                    self.clients[pkt.id] = {'name': pkt.name, 'company_id': cid}
+            except Exception as e:
+                self.log.error(f"Client info handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.ClientUpdatePacket)
         async def on_client_update(admin, pkt):
-            cid = 255 if pkt.company_id == 255 else pkt.company_id + 1
-            if pkt.id in self.clients:
-                self.clients[pkt.id]['company_id'] = cid
-            
-            if pkt.id in self.reset_pending and cid == 255:
-                company_id, timeout_task = self.reset_pending.pop(pkt.id)
-                timeout_task.cancel()
-                await self.admin.send_rcon(f"reset_company {company_id}")
-                await self.msg(f"Company #{company_id} reset", pkt.id)
+            try:
+                cid = self.normalize_company_id(pkt.company_id)
+                if pkt.id in self.clients:
+                    self.clients[pkt.id]['company_id'] = cid
+                
+                if pkt.id in self.reset_pending and cid == 255:
+                    company_id, timeout_task = self.reset_pending.pop(pkt.id)
+                    timeout_task.cancel()
+                    await self.admin.send_rcon(f"reset_company {company_id}")
+                    await self.msg(f"Company #{company_id} reset", pkt.id)
+            except Exception as e:
+                self.log.error(f"Client update handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         async def on_client_remove(admin, pkt):
-            self.clients.pop(pkt.id, None)
-            if pkt.id in self.reset_pending:
-                _, timeout_task = self.reset_pending.pop(pkt.id)
-                timeout_task.cancel()
+            try:
+                self.clients.pop(pkt.id, None)
+                if pkt.id in self.reset_pending:
+                    _, timeout_task = self.reset_pending.pop(pkt.id)
+                    timeout_task.cancel()
+            except Exception as e:
+                self.log.error(f"Client remove handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.CompanyRemovePacket)
         async def on_company_remove(admin, pkt):
-            cid = 255 if pkt.id == 255 else pkt.id + 1
-            self.companies.pop(cid, None)
+            try:
+                cid = self.normalize_company_id(pkt.id)
+                self.companies.pop(cid, None)
+            except Exception as e:
+                self.log.error(f"Company remove handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.NewGamePacket)
         async def on_new_game(admin, pkt):
-            self.companies.clear()
-            self.clients.clear()
-            self.game_date = None
-            self.goal_reached = False
-            self.paused = None
-            await self.poll_all()
+            try:
+                self.companies.clear()
+                self.clients.clear()
+                self.game_date = None
+                self.goal_reached = False
+                self.paused = None
+                await self.poll_all()
+            except Exception as e:
+                self.log.error(f"New game handler error: {e}")
 
         @self.admin.add_handler(openttdpacket.ShutdownPacket)
         async def on_shutdown(admin, pkt):
@@ -157,10 +190,15 @@ class Bot:
     async def economy_loop(self):
         while not self.stop.is_set():
             await asyncio.sleep(30)
-            await self.poll_economy()
-            await self.check_dead_companies()
-            await self.check_goal()
-            await self.sync_pause()
+            if self.stop.is_set():
+                break
+            try:
+                await self.poll_economy()
+                await self.check_dead_companies()
+                await self.check_goal()
+                await self.sync_pause()
+            except Exception as e:
+                self.log.error(f"Economy loop error: {e}")
 
     async def sync_pause(self):
         desired = len(self.companies) == 0
@@ -181,10 +219,11 @@ class Bot:
                 
                 await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)} company value!")
                 
-                for i in range(self.cfg.reset_countdown_seconds, 0, -1):
-                    await asyncio.sleep(1)
+                for i in (20, 10, 5):
+                    if self.stop.is_set():
+                        return
                     await self.broadcast(f"Map resets in {i}s...")
-                
+                    await asyncio.sleep(i if i != 5 else 5)
                 await self.admin.send_rcon(f"load {self.cfg.load_scenario}")
                 self.companies.clear()
                 self.clients.clear()
@@ -203,7 +242,32 @@ class Bot:
                     if client.get('company_id') == cid:
                         await self.admin.send_rcon(f"move {client_id} 255")
                 await self.admin.send_rcon(f"reset_company {cid}")
-                await self.broadcast(f"Inactive company {company_name} auto-reset")
+                await self.broadcast(f"Inactive company {data.get('name', 'Unknown')} auto-reset")
+
+    def build_cv_lines(self) -> list[str]:
+        if not self.companies:
+            return ["No companies"]
+        lines = ["=== Company Values Rankings ==="]
+        for i, (_, data) in enumerate(sorted(
+                self.companies.items(),
+                key=lambda x: x[1].get('value', 0),
+                reverse=True)[:10], 1):
+            lines.append(f"{i}. {data.get('name', 'N/A')}: {self.fmt(data.get('value', 0))}")
+        return lines
+
+    async def hourly_cv_loop(self):
+        while not self.stop.is_set():
+            now = datetime.now()
+            next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+            await asyncio.sleep((next_hour - now).total_seconds())
+            if self.stop.is_set():
+                break
+            try:
+                await self.poll_economy()
+                lines = self.build_cv_lines()
+                await self.broadcast('\n'.join(lines))
+            except Exception as e:
+                self.log.error(f"Hourly CV loop error: {e}")
 
     async def handle_command(self, cid: int, cmd: str):
         parts = cmd.split()
@@ -223,13 +287,8 @@ class Bot:
         
         elif command == 'cv':
             await self.poll_economy()
-            if not self.companies:
-                await self.msg("No companies", cid)
-            else:
-                lines = ["=== Company Values ==="]
-                for i, (_, data) in enumerate(sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10], 1):
-                    lines.append(f"{i}. {data.get('name', 'N/A')}: {self.fmt(data.get('value', 0))}")
-                await self.msg('\n'.join(lines), cid)
+            lines = self.build_cv_lines()
+            await self.msg('\n'.join(lines), cid)
         
         elif command == 'reset':
             await self.poll_clients()
@@ -238,7 +297,6 @@ class Bot:
                 await self.msg("Must be in a company to reset", cid)
             else:
                 company_id = client['company_id']
-                company_name = self.companies.get(company_id, {}).get('name', f'Company {company_id}')
                 
                 async def expire():
                     await asyncio.sleep(10)
@@ -278,13 +336,11 @@ def build_configs(settings: dict) -> list[Config]:
     return [Config(
         admin_port=port,
         server_ip=settings["server_ip"],
-        admin_name=settings["admin_name"],
         admin_pass=settings["admin_pass"],
         goal_value=settings["goal_value"],
         load_scenario=settings["load_scenario"],
         dead_co_age=settings["dead_co_age"],
         dead_co_value=settings["dead_co_value"],
-        reset_countdown_seconds=settings.get("reset_countdown_seconds", 20),
     ) for port in settings.get("admin_ports", [])]
 
 
@@ -300,6 +356,19 @@ def signal_handler(sig, frame):
 async def main():
     settings = load_settings()
     configs = build_configs(settings)
+    
+    if not configs:
+        root_logger.error("No admin_ports configured")
+        sys.exit(1)
+    
+    for cfg in configs:
+        if cfg.goal_value <= 0:
+            root_logger.error(f"Invalid goal_value for port {cfg.admin_port}")
+            sys.exit(1)
+        if cfg.dead_co_age < 0:
+            root_logger.error(f"Invalid dead_co_age for port {cfg.admin_port}")
+            sys.exit(1)
+    
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
     root_logger.info('=== OpenTTD Admin Bot Starting ===')
