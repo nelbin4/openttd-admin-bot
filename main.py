@@ -61,6 +61,7 @@ class Bot:
         self.goal_reached = False
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
+        self.companies_marked_for_reset: set[int] = set()
 
     def _reset_state(self):
         self.companies.clear()
@@ -71,6 +72,7 @@ class Bot:
         for _, task in self.reset_pending.values():
             task.cancel()
         self.reset_pending.clear()
+        self.companies_marked_for_reset.clear()
 
     def _cancel_reset_pending(self, cid: int):
         entry = self.reset_pending.pop(cid, None)
@@ -289,6 +291,7 @@ class Bot:
     async def _on_company_remove(self, pkt):
         cid = self.normalize_company_id(pkt.id)
         self.companies.pop(cid, None)
+        self.companies_marked_for_reset.discard(cid)
 
     async def _on_new_game(self, _pkt):
         self._reset_state()
@@ -348,16 +351,31 @@ class Bot:
         if year is None:
             return
         for cid, data in list(self.companies.items()):
+            # If already marked, wait briefly, refresh clients, then reset when empty
+            if cid in self.companies_marked_for_reset:
+                await asyncio.sleep(1)
+                await self.poll_clients()
+                await asyncio.sleep(0.2)
+                has_clients = any(
+                    client.get('company_id') == cid
+                    for client in self.clients.values()
+                )
+                if not has_clients:
+                    await self.admin.send_rcon(f"reset_company {cid}")
+                    await self.send_lines(f"Inactive company {data.get('name', 'Unknown')} auto-reset")
+                    self.companies_marked_for_reset.discard(cid)
+                continue
+
             founded = data.get('founded')
             if founded is None:
                 continue
             age = year - founded
             if age >= self.cfg.dead_co_age and data.get('value', 0) < self.cfg.dead_co_value:
+                self.companies_marked_for_reset.add(cid)
                 for client_id, client in list(self.clients.items()):
                     if client.get('company_id') == cid:
                         await self.admin.send_rcon(f"move {client_id} {SPECTATOR_ID}")
-                await self.admin.send_rcon(f"reset_company {cid}")
-                await self.send_lines(f"Inactive company {data.get('name', 'Unknown')} auto-reset")
+                # reset will occur on next pass after clients have moved
 
     async def hourly_cv_loop(self):
         while not self.stop.is_set():
