@@ -15,6 +15,7 @@ from pyopenttdadmin.enums import *
 class Config:
     admin_port: int
     server_ip: str
+    admin_name: str
     admin_pass: str
     goal_value: int
     load_scenario: str
@@ -39,11 +40,31 @@ class Bot:
         self.goal_reached = False
         self.paused: bool | None = None
         self.reset_pending: dict[int, tuple[int, asyncio.Task]] = {}
-
-    def normalize_company_id(self, pkt_id: int) -> int:
-        return 255 if pkt_id == 255 else pkt_id + 1
+        
+        self.max_reconnect_attempts = 10
+        self.reconnect_delay = 5.0
 
     async def start(self):
+        attempt = 0
+        while not self.stop.is_set() and attempt < self.max_reconnect_attempts:
+            try:
+                await self.run_bot()
+                break  # Clean exit
+            except Exception as e:
+                attempt += 1
+                self.log.error(f"Connection error: {e}")
+                
+                if attempt >= self.max_reconnect_attempts:
+                    self.log.error("Max reconnection attempts reached")
+                    break
+                
+                delay = min(self.reconnect_delay * (2 ** (attempt - 1)), 300)
+                self.log.info(f"Reconnecting in {delay}s (attempt {attempt}/{self.max_reconnect_attempts})...")
+                await asyncio.sleep(delay)
+        
+        self.log.info("Bot stopped")
+
+    async def run_bot(self):
         async with AsyncAdmin(self.cfg.server_ip, self.cfg.admin_port) as admin:
             self.admin = admin
             await admin.login(self.cfg.admin_name, self.cfg.admin_pass)
@@ -65,7 +86,8 @@ class Bot:
                     for packet in await admin.recv():
                         await admin.handle_packet(packet)
                 except Exception as e:
-                    self.log.error(f"Error: {e}")
+                    self.log.error(f"Packet handling error: {e}")
+                    raise
                 await asyncio.sleep(0.1)
             
             self.log.info("Bot stopping, cleaning up connection...")
@@ -219,11 +241,21 @@ class Bot:
                 
                 await self.broadcast(f"{winner_name} WINS! Reached {self.fmt(self.cfg.goal_value)} company value!")
                 
-                for i in (20, 10, 5):
-                    if self.stop.is_set():
-                        return
-                    await self.broadcast(f"Map resets in {i}s...")
-                    await asyncio.sleep(i if i != 5 else 5)
+                await self.broadcast("Map resets in 20s...")
+                await asyncio.sleep(10)
+                if self.stop.is_set():
+                    return
+                
+                await self.broadcast("Map resets in 10s...")
+                await asyncio.sleep(5)
+                if self.stop.is_set():
+                    return
+                
+                await self.broadcast("Map resets in 5s...")
+                await asyncio.sleep(5)
+                if self.stop.is_set():
+                    return
+                
                 await self.admin.send_rcon(f"load {self.cfg.load_scenario}")
                 self.companies.clear()
                 self.clients.clear()
@@ -336,6 +368,7 @@ def build_configs(settings: dict) -> list[Config]:
     return [Config(
         admin_port=port,
         server_ip=settings["server_ip"],
+        admin_name=settings["admin_name"],
         admin_pass=settings["admin_pass"],
         goal_value=settings["goal_value"],
         load_scenario=settings["load_scenario"],
