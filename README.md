@@ -5,11 +5,6 @@
 
 > A lightweight python based app for Openttd Admin Bot, managing multiple servers.
 
-## What’s inside
-
-- **Main entry point:** `main.py`
-- **Settings file:** `settings.json`
-
 ## Highlights
 
 - **Auto pause/unpause** pauses when no company; unpause when there is one.
@@ -23,20 +18,20 @@
 
 | File                | Purpose                                                                   |
 | ----------------    | -------------------------------------                                     |
-| `main.py`           | Main entry point (reads `settings.json`; supports many servers. |
-| `settings.json`     | Multi-server config: admin ports, credentials, scenario, thresholds. |
-| `requirements.txt`  | Python dependencies (primary: `pyOpenTTDAdmin`).                          |
+| `main.py`           | Main entry point; supports many servers. |
+| `settings.json`     | Settings file; set ip, password, etc. |
+| `requirements.txt`  | Python dependencies (`pyOpenTTDAdmin`).                          |
 
 ## Requirements
 
-- OpenTTD ≥ 15.x with **admin port open** (TCP 3977 default)
-- Python **3.10 – 3.13**
-- Upload your scenario file on the server (folder `scenario`)
+- Dedicated OpenTTD server with admin port opened
+- Python 3.10+ – 3.13**
+- Upload a map to load when goal reached (folder `save` or `scenario`)
 
 ## Configuration
 
-### Configuration (main.py)
-Set values inside `settings.json`. Higher server counts depend on hardware/network headroom.
+### Configuration
+Set values inside `settings.json`. Add admin ports -- higher server counts depend on hardware/network headroom.
 
 ```json
 {
