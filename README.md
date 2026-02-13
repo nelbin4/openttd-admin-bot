@@ -10,6 +10,7 @@
 - **Auto pause/unpause** pauses when no company; unpause when there is one.
 - **Goal tracking**: watches top company value, announces winner → loads new map.
 - **Dead company cleanup**: automatically resets aged/low-value companies.
+- **Greet message**: greet newly connected clients.
 - **Player self-service**: `!reset` + `moving to spectator` for company reset.
 - **Startup hygiene**: removes “Unnamed” company; default company for scenario maps.
 - **Rcon data**: uses rcon commands on companies, clients, and date for reliability instead of packets.
