@@ -19,6 +19,7 @@ DATE_RE = re.compile(r"Date:\s*(\d{4})-\d{2}-\d{2}")
 
 
 def fmt(v):
+    """Format large numbers with k/m/b suffixes"""
     for threshold, suffix in [(1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")]:
         if v >= threshold:
             return f"{v/threshold:.1f}{suffix}"
@@ -30,6 +31,7 @@ class Bot:
         self.cfg, self.log = cfg, log
         self.admin = None
         self.running = False
+        self._lock = threading.RLock()
         self.companies = {}
         self.clients = {}
         self.game_year = 0
@@ -64,21 +66,29 @@ class Bot:
                 time.sleep(0.05)
 
     def poll_rcon(self):
-        co_out = self.rcon("companies")
-        cl_out = self.rcon("clients")
-        dt_out = self.rcon("get_date")
-        self.companies.clear()
-        for m in COMPANY_RE.finditer(co_out):
-            cid, name, year, money, loan, value = m.groups()
-            self.companies[int(cid)] = {'name': name.strip(), 'founded': int(year), 'value': int(value.replace(',', ''))}
-        self.clients.clear()
-        for m in CLIENT_RE.finditer(cl_out):
-            client_id, name, company_id = m.groups()
-            self.clients[int(client_id)] = {'name': name, 'company_id': int(company_id)}
-        dm = DATE_RE.search(dt_out)
-        if dm:
-            self.game_year = int(dm.group(1))
-        self.log.debug(f"Poll: {len(self.companies)} cos, {len(self.clients)} cls, year={self.game_year}")
+        try:
+            co_out = self.rcon("companies")
+            cl_out = self.rcon("clients")
+            dt_out = self.rcon("get_date")
+            
+            with self._lock:
+                self.companies.clear()
+                for m in COMPANY_RE.finditer(co_out):
+                    cid, name, year, money, loan, value = m.groups()
+                    self.companies[int(cid)] = {'name': name.strip(), 'founded': int(year), 'value': int(value.replace(',', ''))}
+                
+                self.clients.clear()
+                for m in CLIENT_RE.finditer(cl_out):
+                    client_id, name, company_id = m.groups()
+                    self.clients[int(client_id)] = {'name': name, 'company_id': int(company_id)}
+                
+                dm = DATE_RE.search(dt_out)
+                if dm:
+                    self.game_year = int(dm.group(1))
+                    
+            self.log.debug(f"Poll: {len(self.companies)} cos, {len(self.clients)} cls, year={self.game_year}")
+        except Exception as e:
+            self.log.error(f"Error in poll_rcon: {e}")
 
     def is_game_paused(self):
         try:
@@ -90,32 +100,52 @@ class Bot:
             return False
 
     def build_cv(self):
-        if not self.companies:
-            return "No companies"
-        lines = ["=== Company Value Rankings ==="]
-        for i, (_, d) in enumerate(sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10], 1):
-            lines.append(f"{i}. {d['name']}: {fmt(d.get('value', 0))}")
+        with self._lock:
+            if not self.companies:
+                return "No companies"
+            lines = ["=== Company Value Rankings ==="]
+            for i, (_, d) in enumerate(sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10], 1):
+                lines.append(f"{i}. {d['name']}: {fmt(d.get('value', 0))}")
         return '\n'.join(lines)
 
     def auto_clean(self):
-        for cid, data in list(self.companies.items()):
-            age = self.game_year - data.get('founded', self.game_year)
-            if age >= self.cfg['clean_age'] and data.get('value', 0) < self.cfg['clean_value']:
-                for client_id, c in list(self.clients.items()):
-                    if c['company_id'] == cid:
-                        self.rcon(f"move {client_id} 255")
+        try:
+            with self._lock:
+                companies_to_clean = []
+                for cid, data in list(self.companies.items()):
+                    age = self.game_year - data.get('founded', self.game_year)
+                    if age >= self.cfg['clean_age'] and data.get('value', 0) < self.cfg['clean_value']:
+                        companies_to_clean.append((cid, data, age))
+            
+            for cid, data, age in companies_to_clean:
+                with self._lock:
+                    clients_to_move = [client_id for client_id, c in self.clients.items() if c['company_id'] == cid]
+                
+                for client_id in clients_to_move:
+                    self.rcon(f"move {client_id} 255")
+                
                 self.rcon(f"reset_company {cid}")
                 self.msg(f"Company {data['name']} auto-reset")
                 self.log.info(f"Auto-clean: co#{cid} {data['name']} age={age} val={data.get('value',0)}")
+        except Exception as e:
+            self.log.error(f"Error in auto_clean: {e}")
 
     def check_goal(self):
         if self.goal_reached:
             return
-        for cid, data in list(self.companies.items()):
-            if data.get('value', 0) >= self.cfg['goal_value']:
-                self.goal_reached = True
-                self.log.info(f"Goal reached: {data['name']} with {fmt(data['value'])}")
-                self.msg(f"{data['name']} WINS! Reached {fmt(self.cfg['goal_value'])} company value!")
+        
+        try:
+            with self._lock:
+                winner = None
+                for cid, data in list(self.companies.items()):
+                    if data.get('value', 0) >= self.cfg['goal_value']:
+                        winner = data
+                        self.goal_reached = True
+                        break
+            
+            if winner:
+                self.log.info(f"Goal reached: {winner['name']} with {fmt(winner['value'])}")
+                self.msg(f"{winner['name']} WINS! Reached {fmt(self.cfg['goal_value'])} company value!")
                 prev = 20
                 for countdown in [20, 15, 10, 5]:
                     self.msg(f"Map resets in {countdown}s...")
@@ -124,57 +154,74 @@ class Bot:
                 time.sleep(5)
                 map_file = self.cfg['load_map']
                 self.rcon(f"load_scenario {map_file}" if map_file.endswith('.scn') else f"load {map_file}")
-                self.companies.clear()
-                self.clients.clear()
-                self.game_year = 0
-                self.goal_reached = False
-                break
+                
+                with self._lock:
+                    self.companies.clear()
+                    self.clients.clear()
+                    self.game_year = 0
+                    self.goal_reached = False
+        except Exception as e:
+            self.log.error(f"Error in check_goal: {e}")
 
     def greet(self, client_id):
         time.sleep(5)
         if not self.running:
             return
-        name = self.clients.get(client_id, {}).get('name', f'Player{client_id}')
-        self.log.info(f"Greet: {name} (#{client_id})")
-        self.msg(f"Welcome {name}! Type !help for commands")
+        try:
+            with self._lock:
+                name = self.clients.get(client_id, {}).get('name', f'Player{client_id}')
+            self.log.info(f"Greet: {name} (#{client_id})")
+            self.msg(f"Welcome {name}! Type !help for commands", client_id)
+        except Exception as e:
+            self.log.error(f"Error in greet: {e}")
 
     def handle_cmd(self, cid, text):
         if self.paused:
             return
+        
         now = time.time()
-        if now - self.cooldowns.get(cid, 0) < 3:
-            return
-        self.cooldowns[cid] = now
+        with self._lock:
+            if now - self.cooldowns.get(cid, 0) < 3:
+                return
+            self.cooldowns[cid] = now
+        
         cmd = text.split()[0].lower() if text.split() else ""
         self.log.info(f"Cmd: !{cmd} from #{cid}")
-        if cmd == "help":
-            self.msg("=== Commands ===\n!info !rules !cv !reset", cid)
-        elif cmd == "info":
-            self.msg(f"=== Game Info ===\nGoal: reach {fmt(self.cfg['goal_value'])} company value\nGamescript: Production Booster\nPrimary Industries(Coal, Wood, Oil, Grain, etc)\nTransported >70% increases <50% decreases production", cid)
-        elif cmd == "rules":
-            self.msg(f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5. Inactive companies (more than {self.cfg['clean_age']}years & company value less than {fmt(self.cfg['clean_value'])}) will auto-reset", cid)
-        elif cmd == "cv":
-            self.poll_rcon()
-            self.msg(self.build_cv(), cid)
-        elif cmd == "reset":
-            client = self.clients.get(cid)
-            if not client or client.get('company_id') == 255:
-                self.msg("Must be in a company to reset", cid)
-                return
-            co = client['company_id']
-            if cid in self.reset_pending:
-                self.msg("Reset already pending. Move to spectator to confirm", cid)
-                return
+        
+        try:
+            if cmd == "help":
+                self.msg("=== Commands ===\n!info !rules !cv !reset", cid)
+            elif cmd == "info":
+                self.msg(f"=== Game Info ===\nGoal: reach {fmt(self.cfg['goal_value'])} company value\nGamescript: Production Booster\nPrimary Industries(Coal, Wood, Oil, Grain, etc)\nTransported >70% increases <50% decreases production", cid)
+            elif cmd == "rules":
+                self.msg(f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5. Inactive companies (more than {self.cfg['clean_age']}years & company value less than {fmt(self.cfg['clean_value'])}) will auto-reset", cid)
+            elif cmd == "cv":
+                self.poll_rcon()
+                self.msg(self.build_cv(), cid)
+            elif cmd == "reset":
+                with self._lock:
+                    client = self.clients.get(cid)
+                    if not client or client.get('company_id') == 255:
+                        self.msg("Must be in a company to reset", cid)
+                        return
+                    co = client['company_id']
+                    if cid in self.reset_pending:
+                        self.msg("Reset already pending. Move to spectator to confirm", cid)
+                        return
 
-            def expire():
-                time.sleep(10)
-                if cid in self.reset_pending:
-                    self.reset_pending.pop(cid, None)
-                    self.msg("Reset cancelled (timeout)", cid)
+                def expire():
+                    time.sleep(10)
+                    with self._lock:
+                        if cid in self.reset_pending:
+                            self.reset_pending.pop(cid, None)
+                            self.msg("Reset cancelled (timeout)", cid)
 
-            self.reset_pending[cid] = co
-            threading.Thread(target=expire, daemon=True).start()
-            self.msg(f"Move to spectator within 10s to reset company #{co}", cid)
+                with self._lock:
+                    self.reset_pending[cid] = co
+                threading.Thread(target=expire, daemon=True).start()
+                self.msg(f"Move to spectator within 10s to reset company #{co}", cid)
+        except Exception as e:
+            self.log.error(f"Error handling command: {e}")
 
     def setup_handlers(self):
         @self.admin.add_handler(openttdpacket.ChatPacket)
@@ -191,20 +238,35 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientInfoPacket)
         def on_client_info(admin, pkt):
-            co = 255 if pkt.company_id == 255 else pkt.company_id + 1
-            self.clients[pkt.id] = {'name': pkt.name, 'company_id': co}
-            self.log.debug(f"ClientInfo: #{pkt.id} {pkt.name} co={co}")
+            try:
+                co = 255 if pkt.company_id == 255 else pkt.company_id + 1
+                with self._lock:
+                    self.clients[pkt.id] = {'name': pkt.name, 'company_id': co}
+                self.log.debug(f"ClientInfo: #{pkt.id} {pkt.name} co={co}")
+            except Exception as e:
+                self.log.error(f"Error in on_client_info: {e}")
 
         @self.admin.add_handler(openttdpacket.ClientUpdatePacket)
         def on_client_update(admin, pkt):
-            co = 255 if pkt.company_id == 255 else pkt.company_id + 1
-            if pkt.id in self.clients:
-                self.clients[pkt.id]['company_id'] = co
-            if pkt.id in self.reset_pending and co == 255:
-                pending_co = self.reset_pending.pop(pkt.id)
-                self.rcon(f"reset_company {pending_co}")
-                self.msg(f"Company #{pending_co} reset", pkt.id)
-                self.log.info(f"Reset confirmed: #{pkt.id} co={pending_co}")
+            try:
+                co = 255 if pkt.company_id == 255 else pkt.company_id + 1
+                with self._lock:
+                    if pkt.id in self.clients:
+                        self.clients[pkt.id]['company_id'] = co
+                    
+                    if pkt.id in self.reset_pending and co == 255:
+                        pending_co = self.reset_pending.pop(pkt.id)
+                        should_reset = True
+                    else:
+                        should_reset = False
+                        pending_co = None
+                
+                if should_reset:
+                    self.rcon(f"reset_company {pending_co}")
+                    self.msg(f"Company #{pending_co} reset", pkt.id)
+                    self.log.info(f"Reset confirmed: #{pkt.id} co={pending_co}")
+            except Exception as e:
+                self.log.error(f"Error in on_client_update: {e}")
 
         @self.admin.add_handler(openttdpacket.ClientJoinPacket)
         def on_client_join(admin, pkt):
@@ -212,28 +274,40 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         def on_client_remove(admin, pkt):
-            self.clients.pop(pkt.id, None)
-            self.reset_pending.pop(pkt.id, None)
+            with self._lock:
+                self.clients.pop(pkt.id, None)
+                self.reset_pending.pop(pkt.id, None)
 
         @self.admin.add_handler(openttdpacket.CompanyRemovePacket)
         def on_company_remove(admin, pkt):
             cid = 255 if pkt.id == 255 else pkt.id + 1
-            self.companies.pop(cid, None)
+            with self._lock:
+                self.companies.pop(cid, None)
 
         @self.admin.add_handler(openttdpacket.CompanyNewPacket)
         def on_company_new(admin, pkt):
-            if self.paused:
-                self.rcon("unpause")
-                self.paused = False
-                self.log.info("Unpaused: company created")
+            try:
+                with self._lock:
+                    if self.paused:
+                        should_unpause = True
+                        self.paused = False
+                    else:
+                        should_unpause = False
+                
+                if should_unpause:
+                    self.rcon("unpause")
+                    self.log.info("Unpaused: company created")
+            except Exception as e:
+                self.log.error(f"Error in on_company_new: {e}")
 
         @self.admin.add_handler(openttdpacket.NewGamePacket)
         def on_new_game(admin, pkt):
-            self.companies.clear()
-            self.clients.clear()
-            self.game_year = 0
-            self.goal_reached = False
-            self.reset_pending.clear()
+            with self._lock:
+                self.companies.clear()
+                self.clients.clear()
+                self.game_year = 0
+                self.goal_reached = False
+                self.reset_pending.clear()
             self.poll_rcon()
             self.log.info("New game detected, state reset")
 
@@ -261,26 +335,34 @@ class Bot:
         next_hourly = (now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).timestamp()
 
         while self.running:
-            for pkt in self.admin.recv():
-                self.admin.handle_packet(pkt)
-            if self.paused:
-                time.sleep(0.2)
-                continue
-            now = time.time()
-            if now >= next_tick:
-                self.poll_rcon()
-                if not self.companies and not self.paused:
-                    self.rcon("pause")
-                    self.paused = True
-                    self.log.info("Paused: no companies")
-                else:
-                    self.auto_clean()
-                    self.check_goal()
-                next_tick = time.time() // 60 * 60 + 60
-            if now >= next_hourly:
-                self.msg(self.build_cv())
-                self.log.info("Hourly CV broadcast")
-                next_hourly += 3600
+            try:
+                for pkt in self.admin.recv():
+                    self.admin.handle_packet(pkt)
+                if self.paused:
+                    time.sleep(0.2)
+                    continue
+                now = time.time()
+                if now >= next_tick:
+                    self.poll_rcon()
+                    with self._lock:
+                        has_companies = bool(self.companies)
+                    
+                    if not has_companies and not self.paused:
+                        self.rcon("pause")
+                        with self._lock:
+                            self.paused = True
+                        self.log.info("Paused: no companies")
+                    else:
+                        self.auto_clean()
+                        self.check_goal()
+                    next_tick = time.time() // 60 * 60 + 60
+                if now >= next_hourly:
+                    self.msg(self.build_cv())
+                    self.log.info("Hourly CV broadcast")
+                    next_hourly += 3600
+            except Exception as e:
+                self.log.error(f"Error in main loop: {e}", exc_info=True)
+                time.sleep(1)
 
         self.log.info("Bot stopped")
 
@@ -298,8 +380,17 @@ def run_bot(cfg, log):
 def main():
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-    with open("settings.json") as f:
-        settings = json.load(f)
+    
+    try:
+        with open("settings.json") as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        print("Error: settings.json not found")
+        return
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in settings.json: {e}")
+        return
+    
     logging.basicConfig(
         level=logging.DEBUG if settings.get("debug") else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
