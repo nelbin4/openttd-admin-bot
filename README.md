@@ -72,7 +72,6 @@ source .venv/bin/activate          # Linux/macOS
 # .venv\Scripts\activate          # Windows
 
 pip install -r requirements.txt
-
 python main.py
 ```
 
@@ -85,24 +84,13 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
+COPY main.py .
 CMD ["python", "main.py"]
 ```
 
-```bash
-docker build -t openttd-admin-bot .
-docker run -d --restart unless-stopped \
-  --name openttdbot \
-  -v $(pwd)/settings.json:/app/settings.json \
-  -v $(pwd)/logs:/app/logs \
-  openttd-admin-bot
-```
-
-For single server inside Docker, change the CMD to `main.py`.
-
 ## Operational notes
 
-- `load_scenario` if you want to load your prefered map.
+- tested with OpenTTD 15.1
 - Use a **strong admin password**—possession grants full control.
 
 ## License
