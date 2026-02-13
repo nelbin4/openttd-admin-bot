@@ -84,7 +84,7 @@ class Bot:
     def build_cv(self):
         if not self.companies:
             return "No companies"
-        lines = ["=== Company Values ==="]
+        lines = ["=== Company Value Rankings ==="]
         for i, (_, d) in enumerate(sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10], 1):
             lines.append(f"{i}. {d['name']}: {fmt(d.get('value', 0))}")
         return '\n'.join(lines)
@@ -141,9 +141,9 @@ class Bot:
         if cmd == "help":
             self.msg("=== Commands ===\n!info !rules !cv !reset", cid)
         elif cmd == "info":
-            self.msg(f"=== Game Info ===\nGoal: reach {fmt(self.cfg['goal_value'])} company value\nGamescript: Production Booster\nTransport >70% increases <50% decreases", cid)
+            self.msg(f"=== Game Info ===\nGoal: reach {fmt(self.cfg['goal_value'])} company value\nGamescript: Production Booster\nPrimary Industries(Coal, Wood, Oil, Grain, etc)\nTransported >70% increases <50% decreases production", cid)
         elif cmd == "rules":
-            self.msg(f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5. Inactive cos (>={self.cfg['clean_age']}y & cv<{fmt(self.cfg['clean_value'])}) auto-reset", cid)
+            self.msg(f"=== Server Rules ===\n1. No griefing/sabotage\n2. No blocking players\n3. No cheating/exploits\n4. Be respectful\n5. Inactive companies (more than {self.cfg['clean_age']}years & company value less than {fmt(self.cfg['clean_value'])}) will auto-reset", cid)
         elif cmd == "cv":
             self.poll_rcon()
             self.msg(self.build_cv(), cid)
@@ -246,6 +246,7 @@ class Bot:
             self.paused = False
         self.running = True
         self.log.info(f"Connected to {self.cfg['server_ip']}:{self.cfg['admin_port']}")
+        self.msg("Admin connected")
 
         next_tick = time.time() // 60 * 60 + 60
         now_dt = datetime.now()
