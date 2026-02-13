@@ -236,16 +236,6 @@ chmod 600 /opt/openttd-bot/settings.json
 chmod 444 /opt/openttd-bot/main.py
 ```
 
-## Performance
-
-| Servers | CPU | Memory |
-|---------|-----|--------|
-| 1 | <1% | ~50MB |
-| 5 | <5% | ~250MB |
-| 10 | <10% | ~500MB |
-
-*Tested on Intel i5 processor*
-
 ## Contributing
 
 ```bash
@@ -261,13 +251,6 @@ python main.py
 
 # Submit pull request
 ```
-
-**Guidelines**:
-- Follow existing code style
-- Maintain thread safety with locks
-- Add error handling (try-except)
-- Test with real servers
-- Update documentation
 
 ## License
 
@@ -287,6 +270,6 @@ MIT License - see [LICENSE](LICENSE) file
 
 ---
 
-**Made with ❤️ for the OpenTTD community**
+**Made for the OpenTTD community**
 
-*Maintained by [@nelbinbinag](https://github.com/nelbinbinag)*
+*Maintained by https://github.com/nelbin4*
