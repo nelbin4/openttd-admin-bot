@@ -3,16 +3,15 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> A lightweight python based app for Openttd Admin Bot, managing multiple servers.
+> A lightweight python based app for Openttd Admin Bot, managing single or multiple servers.
 
 ## Highlights
 
 - **Auto pause/unpause** pauses when no company; unpause when there is one.
-- **Goal tracking**: watches top company value, announces winner → loads new map.
+- **Goal tracking**: watches company value, announces winner → loads new map.
 - **Dead company cleanup**: automatically resets aged/low-value companies.
 - **Greet message**: greet newly connected clients.
-- **Player self-service**: `!reset` + `moving to spectator` for company reset.
-- **Startup hygiene**: removes “Unnamed” company; default company for scenario maps.
+- **Reset self-service**: clients can chat `!reset` and moving to spectator for company reset.
 - **Rcon data**: uses rcon commands on companies, clients, and date for reliability instead of packets.
 
 ## Files & entrypoints
@@ -27,11 +26,11 @@
 
 - Dedicated OpenTTD server with admin port opened
 - Python 3.10+
-- Upload a map to load when goal reached (folder `save` or `scenario`)
+- Upload a map to load when goal reached (folder sav `save` or scn `scenario`)
 
 ## Configuration
 
-Set values inside `settings.json`. Add admin ports -- higher server counts depend on hardware/network headroom.
+Set values inside `settings.json`. Multiple admin ports -- higher server count depend on hardware/network headroom.
 
 ```json
 {
@@ -55,7 +54,7 @@ Command | Action
 `!info`    | Goal and Gamescript information
 `!rules`   | Server rules
 `!cv`      | Ranking company values
-`!reset`   | Request to reset your current company
+`!reset`   | Request reset your current company
 
 ## Run locally
 
