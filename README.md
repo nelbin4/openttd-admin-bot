@@ -56,10 +56,10 @@ Set values inside `settings.json`. Higher server counts depend on hardware/netwo
 Command | Action
 ---|---
 `!help`    | List commands
-`!info`    | Server description + goal amount
-`!rules`   | Basic server rules
-`!cv`      | Top 10 company values + % to goal
-`!reset`   | Request to delete your current company
+`!info`    | Goal and Gamescript information
+`!rules`   | Server rules
+`!cv`      | Ranking company values
+`!reset`   | Request to reset your current company
 
 ## Run locally
 
