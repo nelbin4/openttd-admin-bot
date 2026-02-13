@@ -37,6 +37,7 @@ class Bot:
         self.goal_reached = False
         self.cooldowns = {}
         self.reset_pending = {}
+        self.paused = False
 
     def rcon(self, cmd):
         self.log.debug(f"RCON> {cmd}")
@@ -58,7 +59,7 @@ class Bot:
         for line in text.split('\n'):
             if line.strip():
                 if cid:
-                    self.admin.send_private(line, cid)
+                    self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT, cid)
                 else:
                     self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.BROADCAST, 0)
                 time.sleep(0.05)
@@ -96,7 +97,7 @@ class Bot:
                     if c['company_id'] == cid:
                         self.rcon(f"move {client_id} 255")
                 self.rcon(f"reset_company {cid}")
-                self.msg(f"Company {data['name']} auto-reset ({age}y, cv {fmt(data.get('value', 0))})")
+                self.msg(f"Company {data['name']} auto-reset")
                 self.log.info(f"Auto-clean: co#{cid} {data['name']} age={age} val={data.get('value',0)}")
 
     def check_goal(self):
@@ -129,6 +130,8 @@ class Bot:
         self.msg(f"Welcome {name}! Type !help for commands")
 
     def handle_cmd(self, cid, text):
+        if self.paused:
+            return
         now = time.time()
         if now - self.cooldowns.get(cid, 0) < 3:
             return
@@ -203,6 +206,13 @@ class Bot:
             cid = 255 if pkt.id == 255 else pkt.id + 1
             self.companies.pop(cid, None)
 
+        @self.admin.add_handler(openttdpacket.CompanyNewPacket)
+        def on_company_new(admin, pkt):
+            if self.paused:
+                self.rcon("unpause")
+                self.paused = False
+                self.log.info("Unpaused: company created")
+
         @self.admin.add_handler(openttdpacket.NewGamePacket)
         def on_new_game(admin, pkt):
             self.companies.clear()
@@ -224,8 +234,16 @@ class Bot:
         self.admin.subscribe(AdminUpdateType.CHAT, AdminUpdateFrequency.AUTOMATIC)
         self.admin.subscribe(AdminUpdateType.CLIENT_INFO, AdminUpdateFrequency.AUTOMATIC)
         self.admin.subscribe(AdminUpdateType.CONSOLE, AdminUpdateFrequency.AUTOMATIC)
+        self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
         self.setup_handlers()
         self.poll_rcon()
+        try:
+            d1 = self.rcon("get_date")
+            time.sleep(3)
+            d2 = self.rcon("get_date")
+            self.paused = DATE_RE.search(d1) and DATE_RE.search(d1).group(0) == (DATE_RE.search(d2).group(0) if DATE_RE.search(d2) else None)
+        except Exception:
+            self.paused = False
         self.running = True
         self.log.info(f"Connected to {self.cfg['server_ip']}:{self.cfg['admin_port']}")
 
@@ -236,11 +254,19 @@ class Bot:
         while self.running:
             for pkt in self.admin.recv():
                 self.admin.handle_packet(pkt)
+            if self.paused:
+                time.sleep(0.2)
+                continue
             now = time.time()
             if now >= next_tick:
                 self.poll_rcon()
-                self.auto_clean()
-                self.check_goal()
+                if not self.companies and not self.paused:
+                    self.rcon("pause")
+                    self.paused = True
+                    self.log.info("Paused: no companies")
+                else:
+                    self.auto_clean()
+                    self.check_goal()
                 next_tick = time.time() // 60 * 60 + 60
             if now >= next_hourly:
                 self.poll_rcon()
@@ -273,7 +299,7 @@ def main():
     threads = []
     for port in settings["admin_ports"]:
         cfg = {**settings, "admin_port": port}
-        name = f"Bot:{port}"
+        name = f"[Server:{port}]"
         t = threading.Thread(target=run_bot, args=(cfg, logging.getLogger(name)), daemon=True, name=name)
         t.start()
         threads.append(t)
