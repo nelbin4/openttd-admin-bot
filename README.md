@@ -117,17 +117,17 @@ Players can interact with the bot using chat commands prefixed with `!`:
 ┌─────────────────────────────────────────────────────────────┐
 │                        Main Process                         │
 │                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
-│  │   Thread 1   │  │   Thread 2   │  │   Thread N   │    │
-│  │ Server:3977  │  │ Server:3978  │  │ Server:397X  │    │
-│  │              │  │              │  │              │    │
-│  │  Bot Instance│  │  Bot Instance│  │  Bot Instance│    │
-│  │   + RLock    │  │   + RLock    │  │   + RLock    │    │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
-│         │                  │                  │             │
-└─────────┼──────────────────┼──────────────────┼─────────────┘
-          │                  │                  │
-          ▼                  ▼                  ▼
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │   Thread 1   │  │   Thread 2   │  │   Thread N   │       │
+│  │ Server:3977  │  │ Server:3978  │  │ Server:397X  │       │
+│  │              │  │              │  │              │       │
+│  │  Bot Instance│  │  Bot Instance│  │  Bot Instance│       │
+│  │   + RLock    │  │   + RLock    │  │   + RLock    │       │
+│  └──────┬───────┘  └───────┬──────┘  └───────┬──────┘       │
+│         │                  │                 │              │
+└─────────┼──────────────────┼─────────────────┼──────────────┘
+          │                  │                 │
+          ▼                  ▼                 ▼
     ┌──────────┐       ┌──────────┐       ┌──────────┐
     │ OpenTTD  │       │ OpenTTD  │       │ OpenTTD  │
     │ Server 1 │       │ Server 2 │       │ Server N │
