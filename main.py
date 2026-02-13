@@ -11,7 +11,7 @@ from pyopenttdadmin import Admin, openttdpacket, AdminUpdateType, AdminUpdateFre
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
 COMPANY_RE = re.compile(
-    r"#\s*:?(\d+)(?:\([^)]+\))?\s+Company Name:\s*'([^']*)'\s+"
+    r"#\s*:?(\d+)(?:\([^)]*\))?\s+Company Name:\s*'([^']*)'\s+"
     r"Year Founded:\s*(\d+)\s+Money:\s*\$?([-0-9,]+)\s+"
     r"Loan:\s*\$?(\d+,?\d*)\s+Value:\s*\$?(\d+,?\d*)", re.I)
 CLIENT_RE = re.compile(r"Client #(\d+)\s+name:\s*'([^']*)'\s+company:\s*(\d+)", re.I)
@@ -178,10 +178,15 @@ class Bot:
     def setup_handlers(self):
         @self.admin.add_handler(openttdpacket.ChatPacket)
         def on_chat(admin, pkt):
-            msg = pkt.message.strip()
-            self.log.debug(f"Chat: #{pkt.id} '{msg}'")
-            if msg.startswith('!'):
-                self.handle_cmd(pkt.id, msg[1:])
+            try:
+                msg = pkt.message.strip()
+                cid = getattr(pkt, 'id', None)
+                self.log.debug(f"Chat received: cid={cid} msg='{msg}'")
+                if msg.startswith('!'):
+                    self.log.info(f"Command detected: {msg} from cid={cid}")
+                    self.handle_cmd(cid, msg[1:])
+            except Exception as e:
+                self.log.error(f"Error in on_chat handler: {e}", exc_info=True)
 
         @self.admin.add_handler(openttdpacket.ClientInfoPacket)
         def on_client_info(admin, pkt):
@@ -245,7 +250,6 @@ class Bot:
         self.admin.subscribe(AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC)
         self.setup_handlers()
         self.poll_rcon()
-        #self.paused = False
         self.paused = self.is_game_paused()
         self.running = True
         self.log.info(f"Connected to {self.cfg['server_ip']}:{self.cfg['admin_port']}")
@@ -273,7 +277,6 @@ class Bot:
                     self.check_goal()
                 next_tick = time.time() // 60 * 60 + 60
             if now >= next_hourly:
-                #self.poll_rcon()
                 self.msg(self.build_cv())
                 self.log.info("Hourly CV broadcast")
                 next_hourly += 3600
@@ -294,7 +297,8 @@ def run_bot(cfg, log):
 def main():
     signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-    settings = json.load(open("settings.json"))
+    with open("settings.json") as f:
+        settings = json.load(f)
     logging.basicConfig(
         level=logging.DEBUG if settings.get("debug") else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
