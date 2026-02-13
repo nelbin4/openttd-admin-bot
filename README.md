@@ -23,6 +23,7 @@
 - **Python**: 3.10 or higher
 - **Memory**: ~40–80 MB per server; 5 servers ~120–200 MB, 10 servers ~220–350 MB; Python base shared, CPU low.
 - **Network**: Stable connection to server(s)
+- **Optional Game script**: "Production Booster" https://bananas.openttd.org/package/game-script/50524442 https://github.com/nelbin4/openttdprodboost
 
 ## Quick Start
 
