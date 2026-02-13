@@ -17,6 +17,7 @@
 - **Dead company cleanup**: automatically resets aged/low-value companies.
 - **Player self-service**: `!reset` + `moving to spectator` for company reset request.
 - **Startup hygiene**: removes “Unnamed” company; default company for scenario maps.
+- **Rcon data**: uses rcon commands on companies and clients for reliability instead of packets.
 
 ## Files & entrypoints
 
