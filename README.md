@@ -21,7 +21,7 @@
 
 - **OpenTTD**: 15.1+ dedicated server with admin port enabled
 - **Python**: 3.10 or higher
-- **Memory**: ~50MB per server instance
+- **Memory**: ~40–80 MB per server; 5 servers ~120–200 MB, 10 servers ~220–350 MB; Python base shared, CPU low.
 - **Network**: Stable connection to server(s)
 
 ## Quick Start
