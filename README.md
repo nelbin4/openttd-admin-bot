@@ -7,15 +7,15 @@
 
 ## What’s inside
 
-- **Server (1 to many servers):** `main.py` — requires `settings.json`; practical limit depends on hardware/network capacity
-- **Python-only stack:** built on [`pyOpenTTDAdmin`](https://pypi.org/project/pyOpenTTDAdmin/)
+- **Main entry point:** `main.py`
+- **Settings file:** `settings.json`
 
 ## Highlights
 
 - **Auto pause/unpause** pauses when no company; unpause when there is one.
 - **Goal tracking**: watches top company value, announces winner → loads new map.
 - **Dead company cleanup**: automatically resets aged/low-value companies.
-- **Player self-service**: `!reset` + `moving to spectator` for company reset request.
+- **Player self-service**: `!reset` + `moving to spectator` for company reset.
 - **Startup hygiene**: removes “Unnamed” company; default company for scenario maps.
 - **Rcon data**: uses rcon commands on companies, clients, and date for reliability instead of packets.
 
