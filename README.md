@@ -30,7 +30,6 @@
 
 ## Configuration
 
-### Configuration
 Set values inside `settings.json`. Add admin ports -- higher server counts depend on hardware/network headroom.
 
 ```json
