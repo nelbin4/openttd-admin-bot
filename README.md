@@ -3,11 +3,11 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> Modern, resilient admin-port bot for **OpenTTD 15.x+**. Auto-pauses idle maps, tracks company value race-to-goal, cleans inactive companies, lets players self-reset, and reloads the scenario when someone wins.
+> A lightweight python based app for Openttd Admin Bot, managing multiple servers.
 
 ## What’s inside
 
-- **Server bot (1 to many servers):** `main.py` — requires `settings.json`; practical limit depends on hardware/network capacity
+- **Server (1 to many servers):** `main.py` — requires `settings.json`; practical limit depends on hardware/network capacity
 - **Python-only stack:** built on [`pyOpenTTDAdmin`](https://pypi.org/project/pyOpenTTDAdmin/)
 
 ## Highlights
@@ -40,14 +40,14 @@ Set values inside `settings.json`. `main.py` reads arrays of ports and will star
 
 ```json
 {
-  "server_ip": "127.0.0.1",         // openttd ip
-  "admin_name": "Admin",
-  "admin_pass": "password",         // change password
-  "admin_ports": [3977],            // add more for multi-server, e.g., [3977, 3978, 3979]
-  "load_scenario": "your_map.scn",  // load a scenario map
-  "goal_value": 10000000000,
-  "dead_co_age": 5,                 // years before auto-clean policy
-  "dead_co_value": 5000000,         // autoclean threshhold company value
+  "server_ip": "127.0.0.1",         // openttd server ip
+  "admin_name": "Admin",            // admin name
+  "admin_pass": "password",         // admin password
+  "admin_ports": [3977],            // add more for multi-server [3976, 3977, 3978, 3979]
+  "load_map": "your_map.scn",       // load map after goal reached "some_map.sav" /save or /scenario folder
+  "goal_value": 10000000000,        // company value goal
+  "dead_co_age": 5,                 // auto clean grace period in yrs
+  "dead_co_value": 5000000,         // auto clean company value threshold
 }
 ```
 
