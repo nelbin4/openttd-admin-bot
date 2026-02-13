@@ -36,7 +36,7 @@
 ## Configuration
 
 ### Configuration (main.py)
-Set values inside `settings.json`. `main.py` reads arrays of ports and will start one bot per `admin_port` entry. Typical setups run 1–10 servers; higher counts depend on your hardware/network headroom.
+Set values inside `settings.json`. Higher server counts depend on hardware/network headroom.
 
 ```json
 {
