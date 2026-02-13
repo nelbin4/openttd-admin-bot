@@ -26,7 +26,7 @@
 ## Requirements
 
 - Dedicated OpenTTD server with admin port opened
-- Python 3.10+ – 3.13**
+- Python 3.10+
 - Upload a map to load when goal reached (folder `save` or `scenario`)
 
 ## Configuration
