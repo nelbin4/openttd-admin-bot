@@ -1,16 +1,10 @@
 {
-  "server_ip": "192.168.1.10",
+  "server_ip": "127.0.0.1",
   "admin_name": "admin",
-  "admin_pass": "PASSWORDPASSWORD",
+  "admin_pass": "YOURPASSWORD",
   "admin_ports": [3967, 3968, 3969, 3970, 3971, 3972, 3973, 3974, 3975, 3976],
-  "game_ports": [3979, 3980, 3981, 3982, 3983, 3984, 3985, 3986, 3987, 3988],
   "load_scenario": "flat2048prodboost.scn",
   "goal_value": 100000000000,
   "dead_co_age": 5,
   "dead_co_value": 5000000,
-  "rcon_retry_max": 3,
-  "rcon_retry_delay": 0.5,
-  "reconnect_max_attempts": 10,
-  "reconnect_delay": 5.0,
-  "reset_countdown_seconds": 20
 }
