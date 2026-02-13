@@ -122,7 +122,8 @@ class Bot:
                     time.sleep(prev - countdown if prev > countdown else 5)
                     prev = countdown
                 time.sleep(5)
-                self.rcon(f"load {self.cfg['load_map']}")
+                map_file = self.cfg['load_map']
+                self.rcon(f"load_scenario {map_file}" if map_file.endswith('.scn') else f"load {map_file}")
                 self.companies.clear()
                 self.clients.clear()
                 self.game_year = 0
