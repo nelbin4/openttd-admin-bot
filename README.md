@@ -35,14 +35,15 @@ Set values inside `settings.json`. Add admin ports -- higher server counts depen
 
 ```json
 {
-  "server_ip": "127.0.0.1",         // openttd server ip
-  "admin_name": "Admin",            // admin name
-  "admin_pass": "password",         // admin password
-  "admin_ports": [3977],            // add more for multi-server [3976, 3977, 3978, 3979]
-  "load_map": "your_map.scn",       // load map after goal reached "some_map.sav" /save or /scenario folder
-  "goal_value": 10000000000,        // company value goal
-  "dead_co_age": 5,                 // auto clean grace period in yrs
-  "dead_co_value": 5000000,         // auto clean company value threshold
+  "server_ip": "127.0.0.1",    // openttd dedicated server ip
+  "admin_name": "admin",       // admin name
+  "admin_pass": "password",    // admin password
+  "admin_ports": [3977],       // add for multi-server [3976, 3977, 3978, 3979]
+  "load_map": "yourmap.scn",   // load map after goal reached "some_map.sav" /save or /scenario folder
+  "goal_value": 100000000000,  // company value goal
+  "clean_age": 1,              // auto clean grace period in yrs
+  "clean_value": 1000,         // auto clean company value threshold
+  "debug": false               // for console logger
 }
 ```
 
