@@ -114,7 +114,7 @@ class Bot:
                     time.sleep(prev - countdown if prev > countdown else 5)
                     prev = countdown
                 time.sleep(5)
-                self.rcon(f"load {self.cfg['load_scenario']}")
+                self.rcon(f"load {self.cfg['load_map']}")
                 self.companies.clear()
                 self.clients.clear()
                 self.game_year = 0
