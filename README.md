@@ -4,8 +4,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![OpenTTD](https://img.shields.io/badge/OpenTTD-15.1+-green.svg)](https://www.openttd.org/)
 
-> Production-ready administrative bot for OpenTTD dedicated servers with multi-server support, automated management, and player interaction.
-
 ## Features
 
 - **Auto Pause/Unpause** - Pauses when no companies exist; unpauses when players join
@@ -21,9 +19,6 @@
 
 - **OpenTTD**: 15.1+ dedicated server with admin port enabled
 - **Python**: 3.10 or higher
-- **Memory**: ~40–80 MB per server; 5 servers ~120–200 MB, 10 servers ~220–350 MB; Python base shared, CPU low.
-- **Network**: Stable connection to server(s)
-- **Optional Game script**: "Production Booster" https://bananas.openttd.org/package/game-script/50524442 https://github.com/nelbin4/openttdprodboost
 
 ## Quick Start
 
@@ -76,8 +71,8 @@ docker run -d --name openttd-bot --restart unless-stopped \
 ```json
 {
   "server_ip": "127.0.0.1",
-  "admin_name": "AdminBot",
-  "admin_pass": "your_secure_password",
+  "admin_name": "Admin",
+  "admin_pass": "password",
   "admin_ports": [3977],
   "load_map": "yourmap.scn",
   "goal_value": 100000000,
@@ -94,23 +89,16 @@ docker run -d --name openttd-bot --restart unless-stopped \
 | `server_ip` | string | OpenTTD server IP address |
 | `admin_name` | string | Admin username (matches openttd.cfg) |
 | `admin_pass` | string | Admin password (matches openttd.cfg) |
-| `admin_ports` | array[int] | List of admin ports to manage |
+| `admin_ports` | array[int] | List of admin ports to manage [e.g. 3967,3968,3969,3970] |
 | `load_map` | string | Map file after goal: save/*.sav or scenario/*.scn |
 | `goal_value` | int | Company value goal to win |
 | `clean_age` | int | Min company age (years) for auto-cleanup |
 | `clean_value` | int | Max company value for auto-cleanup |
 | `debug` | bool | Enable debug logging (default: false) |
 
-### OpenTTD Server Setup
+## How It Works
 
-Edit `openttd.cfg`:
-```ini
-[network]
-server_admin_port = 3977
-admin_password = your_secure_password
-```
-
-## Player Commands
+### Player Commands
 
 All commands use `!` prefix with 3-second cooldown:
 
@@ -128,26 +116,11 @@ All commands use `!` prefix with 3-second cooldown:
 3. Move to spectator to confirm
 4. Company is reset
 
-## How It Works
-
-### Architecture
-- **Multi-threaded**: One thread per server
-- **RCON-based**: Uses RCON commands for reliable state management
-- **Event-driven**: Packet handlers for chat, joins, company changes
-- **60s tick**: Periodic polling for cleanup and goal checking
-
-### Thread Safety
-All shared state protected with `threading.RLock()`:
-```python
-with self._lock:
-    # Safe access to companies, clients, game state
-    pass
-```
-
 ### Auto-Clean Logic
 Companies are reset if:
-- Age >= `clean_age` years **AND**
-- Value < `clean_value`
+- Age >= `clean_age` years **AND** company value < `clean_value`
+- Clients joined to company will be moved to spectators
+- This is checked every 60s (loop)
 
 ### Goal System
 1. Monitors all company values every 60 seconds
@@ -156,66 +129,28 @@ Companies are reset if:
 4. Loads map from `load_map` configuration
 5. Resets all state for fresh game
 
-## Logging
+## Troubleshooting
 
 ### Enable Debug Mode
+Modify value in settings.json
 ```json
 { "debug": true }
 ```
 
-### Log Examples
-```
-2024-02-13 10:30:45 INFO Bot === OpenTTD Admin Bot Starting ===
-2024-02-13 10:30:45 INFO [Server:3977] Connected to 192.168.1.100:3977
-2024-02-13 10:30:50 INFO [Server:3977] Greet: Player1 (#1)
-2024-02-13 10:31:30 INFO [Server:3977] Cmd: !cv from #1
-2024-02-13 10:45:00 INFO [Server:3977] Hourly CV broadcast
-```
-
-## Production Deployment
-
-### Systemd Service
-```bash
-# Create /etc/systemd/system/openttd-bot.service
-sudo systemctl enable openttd-bot
-sudo systemctl start openttd-bot
-```
-
-## Troubleshooting
-
 ### Bot Won't Connect
 ```bash
-# Test connectivity
-telnet <server_ip> <admin_port>
+# try adding this on openttd.cfg
+[version]
+version_string = 15.1
+version_number = 1F086D64
+ini_version = 7
 
-# Check OpenTTD config
-grep -A5 "\[network\]" openttd.cfg
-
-# Verify credentials match between settings.json and openttd.cfg
 ```
 
-### Commands Not Working
-- Commands must start with `!` (e.g., `!help`)
-- 3-second cooldown between commands per player
-- Game must not be paused
-- Check logs: enable `"debug": true`
-
 ### Map Won't Load After Goal
-- Verify file exists in `save/` or `scenario/` folder
+- Verify file exists in `/save/` or `/scenario/` folder
 - Filename in settings.json must match exactly (case-sensitive)
 - Test manually: `rcon_pw <pass> "load yourmap.sav"`
-
-### Debug Checklist
-- [ ] Check bot logs with `"debug": true`
-- [ ] Verify network connectivity
-- [ ] Confirm admin credentials match
-- [ ] Test RCON access manually
-- [ ] Ensure map file exists
-
-## Security
-
-### Admin Password
-⚠️ **Admin password grants full server control**
 
 **Best Practices**:
 ```bash
@@ -224,8 +159,6 @@ openssl rand -base64 32
 
 # Protect settings file
 chmod 600 settings.json
-
-# Firewall admin ports from public internet
 ```
 
 ### File Permissions
@@ -237,40 +170,15 @@ chmod 600 /opt/openttd-bot/settings.json
 chmod 444 /opt/openttd-bot/main.py
 ```
 
-## Contributing
-
-```bash
-# Fork and clone
-git clone https://github.com/your-username/openttd-admin.git
-cd openttd-admin
-
-# Create feature branch
-git checkout -b feature/your-feature
-
-# Make changes and test
-python main.py
-
-# Submit pull request
-```
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) file
-
-## Support
-
-- **Issues**: [GitHub Issues](../../issues)
-- **Discussions**: [GitHub Discussions](../../discussions)
-- **OpenTTD Community**: [OpenTTD Forums](https://www.tt-forums.net/)
 
 ## Acknowledgments
 
 - [OpenTTD Team](https://www.openttd.org/)
 - [pyOpenTTDAdmin](https://github.com/ropenttd/pyopenttdadmin) library
-- All contributors
 
 ---
 
 **Made for the OpenTTD community**
-
-*Maintained by https://github.com/nelbin4*
