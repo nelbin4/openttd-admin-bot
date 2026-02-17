@@ -105,6 +105,7 @@ Add more servers by adding `[server3]`, `[server4]`, and so on.
 ## How It Works
 - Auto-clean: companies reset if age >= `clean_age` and value < `clean_value` (checked every 60s)
 - Goal system: when company value >= `goal`, announces winner, counts down, reloads map, and resets state
+- Anti-griefing: Set Maximum Companies per client on a game
 - Pause detection: tracks date changes; paused games ignore commands and greet accordingly
 
 ## Troubleshooting
