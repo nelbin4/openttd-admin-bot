@@ -24,7 +24,7 @@ Async Python bot for managing OpenTTD multiplayer servers with auto-pause, goal 
 
 ## Quick Start
 ```bash
-git clone https://github.com/yourusername/openttd-admin-bot.git
+git clone https://github.com/nelbin4/openttd-admin-bot.git
 cd openttd-admin-bot
 python -m venv venv
 # On Linux/macOS
@@ -32,7 +32,7 @@ source venv/bin/activate
 # On Windows
 venv\Scripts\activate
 pip install pyopenttdadmin
-cp settings.example.cfg settings.cfg
+# Edit settings.cfg with your server info
 python main.py
 ```
 
@@ -76,7 +76,7 @@ map = casual.scn
 goal = 50000000
 clean_age = 3
 clean_value = 50000
-debug = false
+debug = true
 ```
 Add more servers by adding `[server3]`, `[server4]`, and so on.
 
@@ -126,6 +126,3 @@ sudo -u ottdbot python main.py
 
 ## License
 MIT License - see [LICENSE](LICENSE)
-
-## Contributing
-Contributions are welcome. Open issues for bugs or feature requests.
