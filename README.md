@@ -93,7 +93,7 @@ Add more servers by adding `[server3]`, `[server4]`, and so on.
 | `clean_value` | int | Maximum company value for auto-cleanup |
 | `debug` | bool | Enable debug logging |
 
-## Player Commands (3-second cooldown, ignored when paused)
+## Player Commands (Cooldown can be set, ignored when paused)
 | Command | Description |
 |---------|-------------|
 | `!help` | Show available commands |
