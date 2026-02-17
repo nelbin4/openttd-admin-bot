@@ -12,6 +12,7 @@ Async Python bot for managing OpenTTD multiplayer servers with auto-pause, goal 
 - Auto cleanup of old, low-value companies based on configurable thresholds
 - Player engagement with welcome messages, chat commands, and hourly rankings
 - Self-service company reset via `!reset` with spectator confirmation
+- Anti-griefing limit: enforces `MAX_COMPANIES_PER_IP` per client and resets extras
 - Multi-server support from a single async instance
 - Event-driven asyncio architecture with minimal resource usage
 - Error resilience with auto-reconnect and graceful shutdown
