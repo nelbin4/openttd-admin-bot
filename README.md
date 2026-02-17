@@ -6,50 +6,36 @@
 
 Async Python bot for managing OpenTTD multiplayer servers with auto-pause, goal tracking, company cleanup, and player engagement features. Built with `aiopyopenttdadmin` for efficient multi-server management.
 
-## ✨ Features
+## Features
+- Auto pause/unpause when no companies exist or when players join
+- Goal tracking with winner announcements and automatic map reloads
+- Auto cleanup of old, low-value companies based on configurable thresholds
+- Player engagement with welcome messages, chat commands, and hourly rankings
+- Self-service company reset via `!reset` with spectator confirmation
+- Multi-server support from a single async instance
+- Event-driven asyncio architecture with minimal resource usage
+- Error resilience with auto-reconnect and graceful shutdown
 
-- **🎮 Auto Pause/Unpause** - Automatically pauses when no companies exist, unpauses when players join
-- **🏆 Goal Tracking** - Monitors company values, announces winners, auto-reloads maps on goal completion
-- **🧹 Auto Cleanup** - Resets old/low-value companies automatically based on configurable thresholds
-- **💬 Player Engagement** - Welcome messages with pause detection, chat commands, hourly CV rankings
-- **🔄 Self-Service Reset** - Players can reset their companies via `!reset` with spectator confirmation
-- **🔧 Multi-Server** - Single bot instance manages 1-15+ servers concurrently with async architecture
-- **⚡ Async Architecture** - Efficient event-driven design using asyncio, minimal resource usage
-- **🛡️ Error Resilient** - Auto-reconnect, graceful shutdown, comprehensive error handling
+## Requirements
+- OpenTTD 14.0+ dedicated server with admin port enabled
+- Python 3.10 or higher
+- Dependencies: `pyopenttdadmin` (includes `aiopyopenttdadmin`)
 
-## 📋 Requirements
-
-- **OpenTTD**: 14.0+ dedicated server with admin port enabled
-- **Python**: 3.10 or higher
-- **Dependencies**: `pyopenttdadmin` (includes `aiopyopenttdadmin`)
-
-## 🚀 Quick Start
-
-### Installation
-
+## Quick Start
 ```bash
-# Clone repository
 git clone https://github.com/yourusername/openttd-admin-bot.git
 cd openttd-admin-bot
-
-# Create virtual environment (recommended)
 python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# venv\Scripts\activate   # Windows
-
-# Install dependencies
+# On Linux/macOS
+source venv/bin/activate
+# On Windows
+venv\Scripts\activate
 pip install pyopenttdadmin
-
-# Configure settings
 cp settings.example.cfg settings.cfg
-nano settings.cfg  # Edit with your server details
-
-# Run bot
 python main.py
 ```
 
-### Docker Deployment
-
+## Docker
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
@@ -60,17 +46,14 @@ RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
 CMD ["python", "-u", "main.py"]
 ```
-
 ```bash
 docker build -t openttd-bot .
 docker run -d --name openttd-bot --restart unless-stopped \
   -v $(pwd)/settings.cfg:/app/settings.cfg:ro openttd-bot
 ```
 
-## ⚙️ Configuration
-
-### settings.cfg
-
+## Configuration
+`settings.cfg`
 ```ini
 [server1]
 ip = 127.0.0.1
@@ -94,9 +77,9 @@ clean_age = 3
 clean_value = 50000
 debug = false
 ```
+Add more servers by adding `[server3]`, `[server4]`, and so on.
 
 ### Parameters
-
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `ip` | string | OpenTTD server IP address |
@@ -104,17 +87,12 @@ debug = false
 | `admin_name` | string | Admin username (matches openttd.cfg) |
 | `admin_pass` | string | Admin password (matches openttd.cfg) |
 | `map` | string | Map file after goal: `map.sav` or `scenario.scn` |
-| `goal` | int | Company value goal to win (e.g., 100000000) |
+| `goal` | int | Company value goal to win |
 | `clean_age` | int | Minimum company age (years) for auto-cleanup |
 | `clean_value` | int | Maximum company value for auto-cleanup |
-| `debug` | bool | Enable debug logging (default: false) |
+| `debug` | bool | Enable debug logging |
 
-**Note**: Add more servers by creating additional `[server3]`, `[server4]` sections.
-
-## 💡 How It Works
-
-### Player Commands (3-second cooldown, ignored when paused)
-
+## Player Commands (3-second cooldown, ignored when paused)
 | Command | Description |
 |---------|-------------|
 | `!help` | Show available commands |
@@ -123,58 +101,29 @@ debug = false
 | `!cv` | Company value rankings (top 10) |
 | `!reset` | Reset your company (requires spectator confirmation within 15s) |
 
-### Key Features
+## How It Works
+- Auto-clean: companies reset if age >= `clean_age` and value < `clean_value` (checked every 60s)
+- Goal system: when company value >= `goal`, announces winner, counts down, reloads map, and resets state
+- Pause detection: tracks date changes; paused games ignore commands and greet accordingly
 
-**Auto-Clean**: Companies reset if age ≥ `clean_age` years AND value < `clean_value` (checked every 60s)
+## Troubleshooting
+- Enable debug: set `debug = true` in settings.cfg
+- Connection issues: ensure `server_admin_port` and `admin_password` are set in openttd.cfg; test with `telnet 127.0.0.1 3977`
+- Map loading: verify file exists in OpenTTD `save/` or `scenario/`; use relative paths like `map.sav`
+- Commands ignored: commands are blocked while paused and limited by the 3-second cooldown
 
-**Goal System**: When value ≥ `goal`, announces winner → countdown (20s/15s/10s/5s) → reloads map → fresh game
-
-**Pause Detection**: Uses date change tracking for accuracy. Paused = date stale → commands ignored, greeting mentions pause
-
-## 🔍 Troubleshooting
-
-**Enable Debug**: Set `debug = true` in settings.cfg
-
-**Connection Issues**: Verify OpenTTD `openttd.cfg` has `server_admin_port` and `admin_password` configured. Test: `telnet 127.0.0.1 3977`
-
-**Map Loading**: Verify file exists in OpenTTD's `save/` or `scenario/` directory. Use relative path like `map.sav`. Test: `rcon_pw <pass> "load map.sav"`
-
-**Commands Not Working**: Commands are ignored when game is paused (no companies). Check 3-second cooldown.
-
-## 🏗️ Technical Details
-
-**Async Architecture**: Event-driven design with asyncio, single-threaded event loop handles 15+ servers efficiently (~15MB total vs ~360MB with threading).
-
-**Dependencies**: `pyopenttdadmin>=1.0.0` (includes both sync and async modules)
-
-## 🔒 Security Best Practices
-
+## Security Best Practices
 ```bash
-# Generate strong admin password
-openssl rand -base64 32
-
-# Protect configuration file
+openssl rand -base64 32 > admin_pass.txt
 chmod 600 settings.cfg
-
-# Run as non-root user
+# Run as non-root
 useradd -r -s /bin/false ottdbot
 chown ottdbot:ottdbot main.py settings.cfg
 sudo -u ottdbot python main.py
 ```
 
-## 📄 License
+## License
+MIT License - see [LICENSE](LICENSE)
 
-MIT License - see [LICENSE](LICENSE) file
-
-## 🙏 Acknowledgments
-
-- [OpenTTD Team](https://www.openttd.org/) - Amazing game and admin protocol
-- [pyOpenTTDAdmin](https://github.com/ropenttd/pyopenttdadmin) - Python library for OpenTTD admin protocol
-
-## 🤝 Contributing
-
-Contributions welcome! Please open issues for bugs or feature requests.
-
----
-
-**Made with ❤️ for the OpenTTD community**
+## Contributing
+Contributions are welcome. Open issues for bugs or feature requests.
