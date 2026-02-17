@@ -371,7 +371,7 @@ class Bot:
                 await self.msg("=== Commands ===\n!info !rules !cv !reset", cid)
             
             elif cmd == "info":
-                await self.msg(f"Goal: first company to reach {fmt(self.cfg.get('goal', 0))} company value wins!\nGamescript: Production Booster v3\nPrimary industries(coal,wood,oil,etc) >70% transported increases, <50% decreases production", cid)
+                await self.msg(f"Goal: first company to reach {fmt(self.cfg.get('goal', 0))} company value wins!\nGamescript: Production Booster v3\nPrimary industries(coal,wood,oil,etc)\nTransported >70% increases production, <50% decreases", cid)
             
             elif cmd == "rules":
                 await self.msg(f"1. No sabotage, respect other players\n2. No griefing or blocking industries/cities\n3. Do not excessively reserve land\n4. Companies >{self.cfg.get('clean_age', 2)}yrs & company value <{fmt(self.cfg.get('clean_value', 1000))} auto-cleaned\n5. Only {MAX_COMPANIES_PER_IP} companies allowed per client", cid)
