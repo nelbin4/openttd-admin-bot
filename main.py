@@ -127,6 +127,10 @@ class Bot:
         self.last_cmd_time = 0.0
         self.tasks: Set[asyncio.Task] = set()
 
+        # Packet-driven synchronization
+        self._client_ready: Dict[int, asyncio.Event] = {}
+        self._new_game_event = asyncio.Event()
+
     def normalize_company_id(self, raw_id: int) -> int:
         """Convert packet company ID (0-based) to internal ID (1-based)."""
         return SPECTATOR_ID if raw_id == SPECTATOR_ID else raw_id + 1
@@ -356,19 +360,26 @@ class Bot:
             map_file = self.cfg.get('map', '')
             if map_file:
                 cmd = f"load_scenario {map_file}" if map_file.endswith('.scn') else f"load {map_file}"
+                self._new_game_event.clear()
                 await self.rcon(cmd)
-                await asyncio.sleep(1)
-                await self.reset_state()
-                await self.poll_clients()
-                await self.poll_state()
-                await self.reset_unnamed_co1()
-                await self.apply_pause_policy()
+                # Wait for NewGamePacket confirmation instead of blind sleep(1)
+                # on_new_game handler will handle reset_state/poll/pause automatically
+                try:
+                    await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    self.log.warning("Timed out waiting for NewGamePacket after map load")
         except Exception as e:
             self.log.error(f"Error reloading map: {e}")
 
     async def greet(self, cid: int) -> None:
-        """Greet new client with pause-aware message."""
-        await asyncio.sleep(GREETING_DELAY)
+        """Greet new client once ClientInfoPacket confirms they are fully in game."""
+        event = self._client_ready.get(cid)
+        if event:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=GREETING_DELAY)
+            except asyncio.TimeoutError:
+                self.log.debug(f"Greeting timeout waiting for ClientInfo #{cid}")
+        
         if not self.running:
             return
         
@@ -535,6 +546,10 @@ class Bot:
                 async with self._lock:
                     self.clients[pkt.id] = {'name': pkt.name, 'company_id': co, 'ip': ip}
                 self.log.debug(f"ClientInfo: #{pkt.id} {pkt.name} co={co} ip={ip}")
+                # Signal greet() that client info is ready
+                event = self._client_ready.get(pkt.id)
+                if event:
+                    event.set()
             except Exception as e:
                 self.log.error(f"Error in on_client_info: {e}")
 
@@ -593,6 +608,7 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientJoinPacket)
         async def on_client_join(admin: Admin, pkt: openttdpacket.ClientJoinPacket) -> None:
+            self._client_ready[pkt.id] = asyncio.Event()
             self.create_task(self.greet(pkt.id))
 
         @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
@@ -601,6 +617,7 @@ class Bot:
                 async with self._lock:
                     self.clients.pop(pkt.id, None)
                     self.reset_pending.pop(pkt.id, None)
+                self._client_ready.pop(pkt.id, None)
             except Exception as e:
                 self.log.error(f"Error in on_client_remove: {e}")
 
@@ -623,13 +640,29 @@ class Bot:
                 async with self._lock:
                     added = cid not in self.companies
                     if added:
-                        self.companies[cid] = {}
-                
+                        # CompanyInfoPacket has name; CompanyNewPacket does not
+                        name = getattr(pkt, "name", None)
+                        self.companies[cid] = {"name": name} if name else {}
+
                 if added:
                     self.log.info(f"Company added: #{cid}")
                     await self.apply_pause_policy()
             except Exception as e:
                 self.log.error(f"Error in on_company_add: {e}")
+
+        @self.admin.add_handler(openttdpacket.CompanyUpdatePacket)
+        async def on_company_update(admin: Admin, pkt: openttdpacket.CompanyUpdatePacket) -> None:
+            try:
+                cid = self.normalize_company_id(pkt.id)
+                name = getattr(pkt, "name", None)
+                async with self._lock:
+                    if cid in self.companies and name:
+                        self.companies[cid]["name"] = name
+                self.log.debug(f"Company updated: #{cid} name='{name}'")
+                # Name may have changed from/to 'Unnamed' - re-check
+                await self.reset_unnamed_co1()
+            except Exception as e:
+                self.log.error(f"Error in on_company_update: {e}")
 
         @self.admin.add_handler(openttdpacket.NewGamePacket)
         async def on_new_game(admin: Admin, pkt: openttdpacket.NewGamePacket) -> None:
@@ -640,6 +673,7 @@ class Bot:
                 await self.poll_state()
                 await self.reset_unnamed_co1()
                 await self.apply_pause_policy()
+                self._new_game_event.set()
             except Exception as e:
                 self.log.error(f"Error in on_new_game: {e}")
 
