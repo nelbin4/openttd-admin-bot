@@ -125,7 +125,6 @@ class Bot:
         # Connection state
         self.last_pause_cmd: Optional[bool] = None
         self.last_cmd_time = 0.0
-        self.connection_warned = False
         self.tasks: Set[asyncio.Task] = set()
 
     def normalize_company_id(self, raw_id: int) -> int:
@@ -157,7 +156,7 @@ class Bot:
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
-                raise TimeoutError(f"RCON command '{cmd}' timed out after {timeout}s")
+                raise TimeoutError(f"RCON command '{cmd}' timed out")
             
             try:
                 packets = await asyncio.wait_for(self.admin.recv(), timeout=remaining)
@@ -173,7 +172,7 @@ class Bot:
                         await self.admin.handle_packet(pkt)
                         
             except asyncio.TimeoutError:
-                raise TimeoutError(f"RCON command '{cmd}' timed out after {timeout}s")
+                raise TimeoutError(f"RCON command '{cmd}' timed out")
 
     async def msg(self, text: str, cid: Optional[int] = None) -> None:
         """Send message to client or broadcast."""
@@ -207,7 +206,7 @@ class Bot:
                     except ValueError as e:
                         self.log.warning(f"Failed to parse company data: {e}")
             
-            self.log.debug(f"Poll: {len(self.companies)} companies, {len(self.clients)} clients, year {self.game_year}")
+            self.log.debug(f"Poll: {len(self.companies)} companies, {len(self.clients)} clients")
             return True
             
         except Exception as e:
@@ -255,7 +254,7 @@ class Bot:
             if self.last_pause_cmd == should_pause:
                 return
             
-            # Rate limit unpause only (pause is critical)
+            # Rate limit unpause only
             if not should_pause and now - self.last_cmd_time < 1.0:
                 return
             
@@ -274,6 +273,7 @@ class Bot:
                 self.is_paused = should_pause
         except Exception as e:
             self.log.error(f"Pause policy error: {e}")
+            raise
 
     async def reset_unnamed_co1(self) -> None:
         """Reset company #1 if unnamed and no clients."""
@@ -310,6 +310,8 @@ class Bot:
                 for c in clients:
                     await self.rcon(f"move {c} {SPECTATOR_ID}")
                 await self.rcon(f"reset_company {cid}")
+                async with self._lock:
+                    self.company_owners.pop(cid, None)
                 await self.msg(f"Company {name} auto-reset")
                 self.log.info(f"Auto-clean: co#{cid} {name} age={age} val={value}")
             except Exception as e:
@@ -465,7 +467,6 @@ class Bot:
     async def enforce_company_limit(self, cid: int, co: int, ip: str) -> None:
         """Enforce company per IP limit and kick if abusive."""
         try:
-            await asyncio.sleep(0.3)
             now = asyncio.get_event_loop().time()
             
             async with self._lock:
@@ -477,8 +478,6 @@ class Bot:
             
             if is_abuse:
                 await self.msg(f"Kicked: Repeated abuse ({VIOLATION_THRESHOLD} violations in {VIOLATION_WINDOW}s)", cid)
-                await self.rcon(f"move {cid} {SPECTATOR_ID}")
-                await self.rcon(f"reset_company {co}")
                 await self.rcon(f"kick {cid}")
                 self.log.warning(f"Kicked client #{cid} (IP {ip}) for abuse")
                 async with self._lock:
@@ -676,10 +675,13 @@ class Bot:
                     await self.admin._writer.wait_closed()
             except Exception as e:
                 self.log.error(f"Error closing admin connection: {e}")
+        
+        self.admin = None
 
     async def run(self) -> None:
-        """Main bot loop."""
+        """Main bot loop with auto-reconnect on connection loss."""
         try:
+            # Initialize connection
             self.admin = Admin(ip=self.cfg['ip'], port=self.cfg['port'])
             await self.admin.login(self.cfg['admin_name'], self.cfg['admin_pass'])
             await self.admin.subscribe(AdminUpdateType.CHAT, AdminUpdateFrequency.AUTOMATIC)
@@ -709,22 +711,11 @@ class Bot:
         
         while self.running:
             try:
-                try:
-                    packets = await self.admin.recv()
-                    
-                    if packets:
-                        for pkt in packets:
-                            await self.admin.handle_packet(pkt)
-                        async with self._lock:
-                            self.connection_warned = False
-                    
-                except Exception as e:
-                    async with self._lock:
-                        if not self.connection_warned:
-                            self.log.warning(f"Connection issue: {e}")
-                            self.connection_warned = True
-                    await asyncio.sleep(1)
-                    continue
+                packets = await self.admin.recv()
+                
+                if packets:
+                    for pkt in packets:
+                        await self.admin.handle_packet(pkt)
                 
                 now = loop.time()
                 
@@ -759,6 +750,10 @@ class Bot:
                     self.log.info("Broadcast leaderboard")
                     next_broadcast = now + BROADCAST_INTERVAL
             
+            except (ConnectionError, OSError, TimeoutError, RuntimeError) as e:
+                self.log.error(f"Connection lost: {e}")
+                await self.cleanup()
+                raise
             except Exception as e:
                 self.log.error(f"Loop error: {e}", exc_info=True)
                 await asyncio.sleep(1)
@@ -783,8 +778,8 @@ async def run_bot(cfg: Dict[str, Any], log: logging.Logger) -> None:
         except KeyboardInterrupt:
             log.info("Interrupted by user")
             break
-        except (ConnectionRefusedError, OSError) as e:
-            log.warning(f"Server [{server_address}] not found, retrying in {RECONNECT_DELAY}s...")
+        except (ConnectionRefusedError, ConnectionError, OSError, TimeoutError) as e:
+            log.warning(f"Server [{server_address}] unavailable, retrying in {RECONNECT_DELAY}s...")
             await asyncio.sleep(RECONNECT_DELAY)
         except Exception as e:
             log.error(f"Unexpected error: {e}, reconnecting in {RECONNECT_DELAY}s...", exc_info=True)
