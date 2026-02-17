@@ -114,7 +114,6 @@ class Bot:
         self.company_owners: Dict[int, str] = {}
         self.clients: Dict[int, Dict[str, Any]] = {}
         self.game_year = 0
-        self.game_date: Optional[int] = None
         self.is_paused = True
         self.goal_reached = False
         
@@ -150,12 +149,7 @@ class Bot:
             raise RuntimeError("Admin connection not initialized")
         
         self.log.debug(f"RCON> {cmd}")
-        
-        try:
-            await self.admin.send_rcon(cmd)
-        except Exception as e:
-            self.log.error(f"Failed to send RCON command '{cmd}': {e}")
-            raise
+        await self.admin.send_rcon(cmd)
         
         buf = []
         deadline = asyncio.get_event_loop().time() + timeout
@@ -188,16 +182,12 @@ class Bot:
         
         for line in text.split('\n'):
             line = line.strip()
-            if not line:
-                continue
-            
-            try:
-                if cid is not None:
-                    await self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.CLIENT, cid)
-                else:
-                    await self.admin._chat(line, Actions.SERVER_MESSAGE, ChatDestTypes.BROADCAST, 0)
-            except Exception as e:
-                self.log.error(f"Failed to send message: {e}")
+            if line:
+                try:
+                    dest = ChatDestTypes.CLIENT if cid is not None else ChatDestTypes.BROADCAST
+                    await self.admin._chat(line, Actions.SERVER_MESSAGE, dest, cid or 0)
+                except Exception as e:
+                    self.log.error(f"Failed to send message: {e}")
 
     async def poll_state(self) -> bool:
         """Poll company state via RCON."""
@@ -251,17 +241,9 @@ class Bot:
         if not self.companies:
             return "No companies"
         
-        sorted_cos = sorted(
-            self.companies.items(),
-            key=lambda x: x[1].get('value', 0),
-            reverse=True
-        )[:10]
-        
+        sorted_cos = sorted(self.companies.items(), key=lambda x: x[1].get('value', 0), reverse=True)[:10]
         lines = ["=== Company Value Rankings ==="]
-        lines.extend(
-            f"{i}. {d['name']}: {fmt(d['value'])}"
-            for i, (_, d) in enumerate(sorted_cos, 1)
-        )
+        lines.extend(f"{i}. {d['name']}: {fmt(d['value'])}" for i, (_, d) in enumerate(sorted_cos, 1))
         return '\n'.join(lines)
 
     async def apply_pause_policy(self) -> None:
@@ -340,7 +322,6 @@ class Bot:
             self.company_owners.clear()
             self.clients.clear()
             self.game_year = 0
-            self.game_date = None
             self.is_paused = True
             self.goal_reached = False
             self.reset_pending.clear()
@@ -357,12 +338,10 @@ class Bot:
         
         async with self._lock:
             winner = next((d for d in self.companies.values() if d.get('value', 0) >= goal), None)
-            if winner:
-                self.goal_reached = True
-                winner_name = winner['name']
-                winner_value = winner['value']
-            else:
+            if not winner:
                 return
+            self.goal_reached = True
+            winner_name, winner_value = winner['name'], winner['value']
         
         self.log.info(f"Goal reached: {winner_name} at {fmt(winner_value)}")
         await self.msg(f"{winner_name} WINS! Reached {fmt(goal)}!")
@@ -397,12 +376,8 @@ class Bot:
                 paused = self.is_paused
             
             self.log.debug(f"Greeting: {name} (#{cid}, paused={paused})")
-            
-            if paused:
-                msg_text = f"Welcome {name}, create a company to unpause game, type !help for commands"
-            else:
-                msg_text = f"Welcome {name}, type !help for commands"
-            
+            msg_text = (f"Welcome {name}, create a company to unpause game, type !help for commands" 
+                       if paused else f"Welcome {name}, type !help for commands")
             await self.msg(msg_text, cid)
             
         except Exception as e:
@@ -413,7 +388,6 @@ class Bot:
         async with self._lock:
             if self.is_paused:
                 return
-            
             now = asyncio.get_event_loop().time()
             if now - self.cooldowns.get(cid, 0) < CHAT_COMMAND_COOLDOWN:
                 return
@@ -468,7 +442,6 @@ class Bot:
             if co == SPECTATOR_ID or co not in self.companies:
                 await self.msg("You must be in a company", cid)
                 return
-            
             token = asyncio.get_event_loop().time()
             self.reset_pending[cid] = (co, token)
         
@@ -477,14 +450,11 @@ class Bot:
         
         async def timeout_handler(request_token: float) -> None:
             await asyncio.sleep(RESET_CONFIRM_TIMEOUT)
-            
             async with self._lock:
                 pending = self.reset_pending.get(cid)
-                if pending and pending[1] == request_token:
+                should_notify = pending and pending[1] == request_token
+                if should_notify:
                     self.reset_pending.pop(cid, None)
-                    should_notify = True
-                else:
-                    should_notify = False
             
             if should_notify:
                 self.log.debug(f"Reset timeout: client #{cid}")
@@ -496,29 +466,21 @@ class Bot:
         """Enforce company per IP limit and kick if abusive."""
         try:
             await asyncio.sleep(0.3)
-            
             now = asyncio.get_event_loop().time()
             
             async with self._lock:
                 if ip not in self.violations:
                     self.violations[ip] = []
                 self.violations[ip].append(now)
-                
-                # Clean old violations
                 self.violations[ip] = [t for t in self.violations[ip] if now - t <= VIOLATION_WINDOW]
-                
                 is_abuse = len(self.violations[ip]) >= VIOLATION_THRESHOLD
             
             if is_abuse:
-                await self.msg(
-                    f"Kicked: Repeated abuse ({VIOLATION_THRESHOLD} violations in {VIOLATION_WINDOW}s)",
-                    cid
-                )
+                await self.msg(f"Kicked: Repeated abuse ({VIOLATION_THRESHOLD} violations in {VIOLATION_WINDOW}s)", cid)
                 await self.rcon(f"move {cid} {SPECTATOR_ID}")
                 await self.rcon(f"reset_company {co}")
                 await self.rcon(f"kick {cid}")
                 self.log.warning(f"Kicked client #{cid} (IP {ip}) for abuse")
-                
                 async with self._lock:
                     self.violations.pop(ip, None)
                     self.companies.pop(co, None)
@@ -527,7 +489,6 @@ class Bot:
                 await self.msg(f"Only {MAX_COMPANIES_PER_IP} companies per client allowed.", cid)
                 await self.rcon(f"move {cid} {SPECTATOR_ID}")
                 await self.rcon(f"reset_company {co}")
-                
                 async with self._lock:
                     self.companies.pop(co, None)
                     self.company_owners.pop(co, None)
@@ -546,14 +507,13 @@ class Bot:
         async def on_console(admin: Admin, pkt: openttdpacket.ConsolePacket) -> None:
             try:
                 msg = pkt.message.strip().lower()
-                if "game paused" in msg or ("paused" in msg and "game" in msg):
-                    async with self._lock:
+                async with self._lock:
+                    if "game paused" in msg or ("paused" in msg and "game" in msg):
                         self.is_paused = True
-                    self.log.debug("Console: Game paused")
-                elif "game unpaused" in msg or "unpaused" in msg:
-                    async with self._lock:
+                        self.log.debug("Console: Game paused")
+                    elif "game unpaused" in msg or "unpaused" in msg:
                         self.is_paused = False
-                    self.log.debug("Console: Game unpaused")
+                        self.log.debug("Console: Game unpaused")
             except Exception as e:
                 self.log.error(f"Error in on_console: {e}")
 
@@ -562,7 +522,6 @@ class Bot:
             try:
                 msg = pkt.message.strip()
                 cid = getattr(pkt, 'id', None)
-                
                 if msg.startswith('!') and cid is not None:
                     self.log.debug(f"Command received: {msg} from #{cid}")
                     await self.handle_cmd(cid, msg[1:])
@@ -600,7 +559,6 @@ class Bot:
                     if co != SPECTATOR_ID and old_co == SPECTATOR_ID and client_ip:
                         if co not in self.company_owners:
                             self.company_owners[co] = client_ip
-                        
                         company_count = self.count_companies_by_ip(client_ip)
                         enforce_limit = company_count > MAX_COMPANIES_PER_IP
                     else:
@@ -623,12 +581,10 @@ class Bot:
                 if pending_co:
                     await self.rcon(f"reset_company {pending_co}")
                     await self.msg(f"Company #{pending_co} reset", pkt.id)
-                    
                     async with self._lock:
                         self.companies.pop(pending_co, None)
                         self.company_owners.pop(pending_co, None)
                         self.last_pause_cmd = None
-                    
                     self.log.info(f"Reset complete: company #{pending_co}")
                     await self.poll_state()
                     await self.apply_pause_policy()
@@ -693,22 +649,18 @@ class Bot:
             try:
                 async with self._lock:
                     self.game_year = (date(1, 1, 1) + timedelta(days=pkt.date)).year - 1
-                    self.game_date = pkt.date
-                self.log.debug(f"Date: {pkt.date} (year {self.game_year})")
+                self.log.debug(f"Date: year {self.game_year}")
             except Exception as e:
                 self.log.error(f"Error in on_date: {e}")
 
         @self.admin.add_handler(openttdpacket.ShutdownPacket)
         async def on_shutdown(admin: Admin, pkt: openttdpacket.ShutdownPacket) -> None:
-            try:
-                self.running = False
-                self.log.info("Server shutdown")
-            except Exception as e:
-                self.log.error(f"Error in on_shutdown: {e}")
+            self.running = False
+            self.log.info("Server shutdown")
 
     async def cleanup(self) -> None:
         """Cleanup resources and cancel tasks."""
-        self.log.info("Cleaning up bot resources...")
+        self.log.debug("Cleaning up bot resources...")
         
         for task in list(self.tasks):
             if not task.done():
@@ -721,11 +673,9 @@ class Bot:
             try:
                 if not self.admin._writer.is_closing():
                     self.admin._writer.close()
-                await self.admin._writer.wait_closed()
+                    await self.admin._writer.wait_closed()
             except Exception as e:
                 self.log.error(f"Error closing admin connection: {e}")
-        
-        self.log.info("Cleanup complete")
 
     async def run(self) -> None:
         """Main bot loop."""
@@ -765,7 +715,6 @@ class Bot:
                     if packets:
                         for pkt in packets:
                             await self.admin.handle_packet(pkt)
-                        
                         async with self._lock:
                             self.connection_warned = False
                     
@@ -782,15 +731,9 @@ class Bot:
                 # Periodic cleanup
                 if now >= next_cleanup:
                     async with self._lock:
-                        self.cooldowns = {
-                            k: v for k, v in self.cooldowns.items()
-                            if now - v < COOLDOWN_CLEANUP_INTERVAL
-                        }
+                        self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < COOLDOWN_CLEANUP_INTERVAL}
                         for ip in list(self.violations.keys()):
-                            self.violations[ip] = [
-                                t for t in self.violations[ip]
-                                if now - t <= VIOLATION_WINDOW
-                            ]
+                            self.violations[ip] = [t for t in self.violations[ip] if now - t <= VIOLATION_WINDOW]
                             if not self.violations[ip]:
                                 self.violations.pop(ip)
                     next_cleanup = now + COOLDOWN_CLEANUP_INTERVAL
@@ -821,7 +764,6 @@ class Bot:
                 await asyncio.sleep(1)
         
         await self.cleanup()
-        self.log.info("Bot stopped")
 
 
 async def run_bot(cfg: Dict[str, Any], log: logging.Logger) -> None:
@@ -837,17 +779,14 @@ async def run_bot(cfg: Dict[str, Any], log: logging.Logger) -> None:
     while True:
         try:
             await Bot(cfg, log).run()
-            log.info(f"Bot stopped, reconnecting to [{server_address}] in {RECONNECT_DELAY}s...")
-            await asyncio.sleep(RECONNECT_DELAY)
+            break
         except KeyboardInterrupt:
             log.info("Interrupted by user")
             break
         except (ConnectionRefusedError, OSError) as e:
-            # Handle connection errors cleanly without traceback
             log.warning(f"Server [{server_address}] not found, retrying in {RECONNECT_DELAY}s...")
             await asyncio.sleep(RECONNECT_DELAY)
         except Exception as e:
-            # Handle unexpected errors with full traceback
             log.error(f"Unexpected error: {e}, reconnecting in {RECONNECT_DELAY}s...", exc_info=True)
             await asyncio.sleep(RECONNECT_DELAY)
 
@@ -871,17 +810,15 @@ async def main() -> None:
         return
     
     log_level = logging.DEBUG if any(s.get('debug') for s in servers) else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log = logging.getLogger("Bot")
     log.info("=== OpenTTD Admin Bot Starting ===")
     
     tasks = []
     for cfg in servers:
         port = cfg.get('port', 'unknown')
-        logger = logging.getLogger(f"Bot[{port}]")
+        ip = cfg.get('ip', 'unknown')
+        logger = logging.getLogger(f"[{ip}:{port}]")
         task = asyncio.create_task(run_bot(cfg, logger))
         tasks.append(task)
     
