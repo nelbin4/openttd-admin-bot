@@ -14,6 +14,8 @@ COMPANY_RE = re.compile(r"#:\s*(\d+)(?:\([^)]*\))?\s+Company Name:\s*'([^']*)'\s
 
 SPECTATOR_ID = 255
 MAX_COMPANIES_PER_IP = 2
+VIOLATION_THRESHOLD = 3
+VIOLATION_WINDOW = 60
 BROADCAST_INTERVAL = 3600
 RCON_TIMEOUT = 5
 MAIN_LOOP_INTERVAL = 60
@@ -74,6 +76,7 @@ class Bot:
         self.last_cmd_time = 0.0
         self.tasks: Set[asyncio.Task] = set()
         self.connection_warned = False
+        self.violations: Dict[str, List[float]] = {}
 
     async def rcon(self, cmd: str, timeout: float = RCON_TIMEOUT) -> str:
         """Execute RCON command and return response."""
@@ -283,6 +286,7 @@ class Bot:
             self.goal_reached = False
             self.reset_pending.clear()
             self.cooldowns.clear()
+            self.violations.clear()
             self.last_pause_cmd = None
             self.last_cmd_time = 0.0
 
@@ -494,14 +498,42 @@ class Bot:
                 if enforce_limit:
                     try:
                         await asyncio.sleep(0.3)
-                        await self.msg(f"Only {MAX_COMPANIES_PER_IP} companies per client allowed.", pkt.id)
-                        await self.rcon(f"move {pkt.id} {SPECTATOR_ID}")
-                        await self.rcon(f"reset_company {co}")
+                        
+                        # Record violation and check for abuse
+                        now = asyncio.get_event_loop().time()
                         async with self._lock:
-                            self.companies.pop(co, None)
-                            self.company_owners.pop(co, None)
-                            if pkt.id in self.clients:
-                                self.clients[pkt.id]['company_id'] = SPECTATOR_ID
+                            client_ip = self.clients[pkt.id].get('ip')
+                            if client_ip not in self.violations:
+                                self.violations[client_ip] = []
+                            self.violations[client_ip].append(now)
+                            
+                            # Remove old violations outside window
+                            self.violations[client_ip] = [t for t in self.violations[client_ip] if now - t <= VIOLATION_WINDOW]
+                            
+                            # Check if this is abuse (3+ violations in 60s)
+                            is_abuse = len(self.violations[client_ip]) >= VIOLATION_THRESHOLD
+                        
+                        if is_abuse:
+                            # Kick abusive client
+                            await self.msg(f"Kicked: Repeated abuse ({VIOLATION_THRESHOLD} violations in {VIOLATION_WINDOW}s)", pkt.id)
+                            await self.rcon(f"move {pkt.id} {SPECTATOR_ID}")
+                            await self.rcon(f"reset_company {co}")
+                            await self.rcon(f"kick {pkt.id}")
+                            self.log.warning(f"Kicked client #{pkt.id} (IP {client_ip}) for abuse: {len(self.violations[client_ip])} violations")
+                            async with self._lock:
+                                self.violations.pop(client_ip, None)
+                                self.companies.pop(co, None)
+                                self.company_owners.pop(co, None)
+                        else:
+                            # Normal enforcement
+                            await self.msg(f"Only {MAX_COMPANIES_PER_IP} companies per client allowed.", pkt.id)
+                            await self.rcon(f"move {pkt.id} {SPECTATOR_ID}")
+                            await self.rcon(f"reset_company {co}")
+                            async with self._lock:
+                                self.companies.pop(co, None)
+                                self.company_owners.pop(co, None)
+                                if pkt.id in self.clients:
+                                    self.clients[pkt.id]['company_id'] = SPECTATOR_ID
                         return
                     except Exception as e:
                         self.log.error(f"Error enforcing IP limit: {e}")
@@ -666,6 +698,11 @@ class Bot:
                     should_cleanup = now >= next_cleanup
                     if should_cleanup:
                         self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < COOLDOWN_CLEANUP_INTERVAL}
+                        # Clean up old violations
+                        for ip in list(self.violations.keys()):
+                            self.violations[ip] = [t for t in self.violations[ip] if now - t <= VIOLATION_WINDOW]
+                            if not self.violations[ip]:
+                                self.violations.pop(ip)
                 
                 if should_cleanup:
                     next_cleanup = now + COOLDOWN_CLEANUP_INTERVAL
