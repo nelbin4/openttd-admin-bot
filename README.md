@@ -123,6 +123,3 @@ useradd -r -s /bin/false ottdbot
 chown ottdbot:ottdbot main.py settings.cfg
 sudo -u ottdbot python main.py
 ```
-
-## License
-MIT License - see [LICENSE](LICENSE)
