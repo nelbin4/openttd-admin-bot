@@ -90,7 +90,6 @@ Add more servers by adding `[server3]`, `[server4]`, etc.
 | `clean_age` | int | Minimum company age (years) to be eligible for auto-clean |
 | `clean_value` | int | Companies below this value get auto-cleaned |
 | `debug` | bool | Enable debug logging |
-Add `[server2]`, `[server3]`, etc. for additional servers.
 
 ## Chat Commands
 | Command | Description |
