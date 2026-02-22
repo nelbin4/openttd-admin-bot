@@ -4,122 +4,104 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![OpenTTD](https://img.shields.io/badge/OpenTTD-14.0+-green.svg)](https://www.openttd.org/)
 
-Async Python bot for managing OpenTTD multiplayer servers with auto-pause, goal tracking, company cleanup, and player engagement features. Built with `aiopyopenttdadmin` for efficient multi-server management.
+Async Python bot for managing OpenTTD multiplayer servers. Handles auto-pause, goal tracking, company cleanup, and player engagement. Supports multiple servers from a single instance.
 
 ## Features
-- Auto pause/unpause when no companies exist or when players join
-- Goal tracking with winner announcements and automatic map reloads
-- Auto cleanup of old, low-value companies based on configurable thresholds
-- Player engagement with welcome messages, chat commands, and interval company value rankings
-- Self-service company reset via `!reset` with spectator confirmation
-- Anti-griefing limit: enforces `MAX_COMPANIES_PER_IP` per client and resets extras
-- Multi-server support from a single async instance
-- Event-driven asyncio architecture with minimal resource usage
-- Error resilience with auto-reconnect and graceful shutdown
+- Auto pause/unpause based on company presence
+- Goal tracking with winner announcement and automatic map reload
+- Auto-clean old low-value companies (configurable age + value thresholds, checked every 60s at :00)
+- Company limit enforcement: max `MAX_COMPANIES_PER_IP` companies per client
+- Welcome messages with country detection, chat commands, leaderboard broadcasts
+- Self-service `!reset` with spectator confirmation timeout
+- Multi-server support via single async process
+- Auto-reconnect on connection loss
 
 ## Requirements
 - OpenTTD 14.0+ dedicated server with admin port enabled
-- Python 3.10 or higher
-- Dependencies: `pyopenttdadmin` (includes `aiopyopenttdadmin`)
+- Python 3.10+
+- `pip install pyopenttdadmin`
 
 ## Quick Start
 ```bash
 git clone https://github.com/nelbin4/openttd-admin-bot.git
 cd openttd-admin-bot
-python -m venv venv
-# On Linux/macOS
-source venv/bin/activate
-# On Windows
-venv\Scripts\activate
+python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install pyopenttdadmin
-# Edit settings.cfg with your server info
+# Edit settings.cfg then:
 python main.py
 ```
 
 ## Docker
+```bash
+docker build -t openttd-bot .
+docker run -d --name openttd-bot --restart unless-stopped \
+  -v $(pwd)/settings.cfg:/app/settings.cfg:ro openttd-bot
+```
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
-COPY requirements.txt .
 RUN pip install --no-cache-dir pyopenttdadmin
 COPY main.py settings.cfg ./
 RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
 CMD ["python", "-u", "main.py"]
 ```
-```bash
-docker build -t openttd-bot .
-docker run -d --name openttd-bot --restart unless-stopped \
-  -v $(pwd)/settings.cfg:/app/settings.cfg:ro openttd-bot
-```
 
-## Configuration
-`settings.cfg`
+## Configuration — `settings.cfg`
 ```ini
 [server1]
 ip = 127.0.0.1
 port = 3977
 admin_name = Admin
 admin_pass = password
-map = competitive.sav
-goal = 100000000
-clean_age = 5
-clean_value = 100000
+goal = 100000000        ; company value to win (0 = disabled)
+map = competitive.scn   ; map/scenario to load after goal (or "newgame")
+clean_age = 5           ; min company age in years for auto-clean
+clean_value = 100000    ; max company value for auto-clean (0 = disabled)
 debug = false
-
-[server2]
-ip = 127.0.0.1
-port = 3978
-admin_name = Admin
-admin_pass = password
-map = casual.scn
-goal = 50000000
-clean_age = 3
-clean_value = 50000
-debug = true
 ```
-Add more servers by adding `[server3]`, `[server4]`, and so on.
+Add `[server2]`, `[server3]`, etc. for additional servers.
 
-### Parameters
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `ip` | string | OpenTTD server IP address |
-| `port` | int | Admin port for this server |
+| `ip` | string | Server IP address |
+| `port` | int | Admin port |
 | `admin_name` | string | Admin username (matches openttd.cfg) |
 | `admin_pass` | string | Admin password (matches openttd.cfg) |
-| `map` | string | Map file after goal: `map.sav` or `scenario.scn` |
-| `goal` | int | Company value goal to win |
-| `clean_age` | int | Minimum company age (years) for auto-cleanup |
-| `clean_value` | int | Maximum company value for auto-cleanup |
+| `goal` | int | Company value win condition (0 = disabled) |
+| `map` | string | Map to load after goal: `.sav`, `.scn`, or `newgame` |
+| `clean_age` | int | Minimum company age (years) to be eligible for auto-clean |
+| `clean_value` | int | Companies below this value get auto-cleaned |
 | `debug` | bool | Enable debug logging |
 
-## Player Commands (Cooldown can be set, ignored when paused)
+## Chat Commands
 | Command | Description |
 |---------|-------------|
-| `!help` | Show available commands |
-| `!info` | Display game goal and mechanics |
-| `!rules` | Show server rules and cleanup thresholds |
-| `!cv` | Company value rankings (top 10) |
-| `!reset` | Reset your company (requires spectator confirmation within 15s) |
+| `!help` | List available commands |
+| `!info` | Game goal and mechanics |
+| `!rules` | Server rules and auto-clean thresholds |
+| `!cv` | Top 10 company value rankings (from 60s cache) |
+| `!reset` | Reset your company — move to spectator within 15s to confirm |
+
+Commands are blocked while the game is paused and rate-limited per client (2s cooldown).
 
 ## How It Works
-- Auto-clean: companies reset if age >= `clean_age` and value < `clean_value` (checked every 60s)
-- Goal system: when company value >= `goal`, announces winner, counts down, reloads map, and resets state
-- Anti-griefing: Set Maximum Companies per client on a game
-- Pause detection: tracks date changes; paused games ignore commands and greet accordingly
+- **Pause**: game pauses when no companies exist, unpauses when first company is created
+- **60s poll**: `rcon companies` runs at every wall-clock `:00` second; updates value cache, triggers goal check and auto-clean
+- **Auto-clean**: resets companies where age ≥ `clean_age` AND value < `clean_value`; moves clients to spectator first
+- **Goal**: when any company reaches `goal`, announces winner, counts down 20s, reloads map
+- **Limit enforcement**: on join, if client already owns `MAX_COMPANIES_PER_IP` companies, extra company is moved + reset
+- **New game**: on map load, default company #1 is always reset if unoccupied
 
 ## Troubleshooting
-- Enable debug: set `debug = true` in settings.cfg
-- Connection issues: ensure `server_admin_port` and `admin_password` are set in openttd.cfg; test with `telnet 127.0.0.1 3977`
-- Map loading: verify file exists in OpenTTD `save/` or `scenario/`; use relative paths like `map.sav`
-- Commands ignored: commands are blocked while paused and limited by the 3-second cooldown
+- **Connection refused**: confirm `server_admin_port` and `admin_password` in `openttd.cfg`; test with `telnet <ip> <port>`
+- **Commands ignored**: blocked while paused or within cooldown window
+- **Map not loading**: verify file exists in OpenTTD `save/` or `scenario/`; use filename only (e.g. `map.scn`)
+- **Debug logs**: set `debug = true` in settings.cfg
 
-## Security Best Practices
+## Security
 ```bash
-openssl rand -base64 32 > admin_pass.txt
 chmod 600 settings.cfg
-# Run as non-root
 useradd -r -s /bin/false ottdbot
-chown ottdbot:ottdbot main.py settings.cfg
 sudo -u ottdbot python main.py
 ```
