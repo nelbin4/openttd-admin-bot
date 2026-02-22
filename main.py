@@ -485,10 +485,10 @@ class Bot:
         await self.msg(f"Welcome {name}{location}{suffix}, type !help for commands", cid)
 
     def _leaderboard(self) -> str:
-        """Build top-10 company value leaderboard from cached data."""
+        """Build company value leaderboard from cached data."""
         if not self.companies:
             return "No companies"
-        ranked = sorted(self.companies.values(), key=lambda c: c.value, reverse=True)[:10]
+        ranked = sorted(self.companies.values(), key=lambda c: c.value, reverse=True)
         return "\n".join(["=== Company Value Rankings ==="] +
             [f"{i}. {d.name}: {fmt(d.value)}" for i, d in enumerate(ranked, 1)])
 
