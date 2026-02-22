@@ -47,11 +47,6 @@ USER botuser
 CMD ["python", "-u", "main.py"]
 ```
 
-## requirements.txt
-```
-aiopyopenttdadmin
-```
-
 ## Configuration — `settings.cfg`
 ```ini
 [server1]
@@ -97,7 +92,7 @@ Add more servers by adding `[server3]`, `[server4]`, etc.
 | `!help` | List available commands |
 | `!info` | Game goal and mechanics |
 | `!rules` | Server rules and auto-clean thresholds |
-| `!cv` | Top 10 company value rankings (from 60s cache) |
+| `!cv` | Company value rankings (from 60s cache) |
 | `!reset` | Reset your company — move to spectator within 15s to confirm |
 
 Commands are blocked while the game is paused and rate-limited per client (2s cooldown).
