@@ -214,7 +214,6 @@ class Bot:
                             buffered.append(pkt)
                 except asyncio.TimeoutError:
                     break
-            
             if not done:
                 raise TimeoutError(f"RCON '{cmd}' timed out")
 
@@ -223,16 +222,19 @@ class Bot:
 
             cw = console_wait.lower()
             if cw and not any(cw in l.lower() for l in buf):
+                found = False
                 cw_end = loop.time() + console_timeout
-                while (rem := cw_end - loop.time()) > 0:
+                while not found and (rem := cw_end - loop.time()) > 0:
                     try:
                         pkts = await asyncio.wait_for(self.admin.recv(), timeout=min(rem, 0.5))
-                        buffered.extend(pkts)
-                        if any(isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower() for p in pkts):
-                            break
                     except asyncio.TimeoutError:
                         break
-                else:
+                    for p in pkts:
+                        if isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower():
+                            found = True
+                        else:
+                            buffered.append(p)
+                if not found:
                     self.log.warning(f"console_wait '{console_wait}' timed out for: {cmd}")
 
         for pkt in buffered:
@@ -358,8 +360,8 @@ class Bot:
             if not winner:
                 return
             self.goal_reached = True
-            winner_name = winner.name
-        self.log.info(f"Goal reached: {winner_name} at {fmt(winner.value)}")
+            winner_name, winner_value = winner.name, winner.value
+        self.log.info(f"Goal reached: {winner_name} at {fmt(winner_value)}")
         self._spawn(self._do_goal_reload(winner_name, goal))
 
     async def _fetch_company_data(self) -> None:
@@ -410,25 +412,18 @@ class Bot:
     async def _poll_loop(self) -> None:
         """Fetch company data at the top of every wall-clock minute (:00s)."""
         while self.running:
-            now = time.time()
-            await asyncio.sleep(60 - now % 60)
-            if not self.running:
-                break
-            async with self._lock:
-                paused = self.is_paused
-            if not paused:
+            await asyncio.sleep(60 - time.time() % 60)
+            if self.running and not self.is_paused:
+                self.log.debug("Poll: fetching company data")
                 await self._fetch_company_data()
 
     async def _reset_state(self) -> None:
         """Cancel all tasks, flush TCP debris, and clear all game state."""
         for task in list(self.tasks):
             task.cancel()
-        if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
-            try:
-                await self._drain(0.1)
-            except Exception:
-                pass
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await self._drain(0.1)
 
         async with self._lock:
             self.companies.clear()
@@ -466,10 +461,9 @@ class Bot:
 
     async def greet(self, cid: int) -> None:
         """Wait up to GREETING_DELAY for ClientInfo then send welcome message."""
-        if event := self._client_ready.get(cid):
+        if event := self._client_ready.pop(cid, None):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout=GREETING_DELAY)
-        self._client_ready.pop(cid, None)
         if not self.running:
             return
         async with self._lock:
@@ -482,10 +476,12 @@ class Bot:
         country = await self._get_country(ip)
         location = f" from {country}" if country else ""
         suffix = ", create a company to unpause game" if paused else ""
-        await self.msg(f"Welcome {name}{location}{suffix}, type !help for commands", cid)
+        await self.msg(f"Welcome {name}{location}")
+        hint = f"{suffix.lstrip(', ')}, type !help for commands" if suffix else "type !help for commands"
+        await self.msg(hint, cid)
 
     def _leaderboard(self) -> str:
-        """Build company value leaderboard from cached data."""
+        """Build top-10 company value leaderboard from cached data."""
         if not self.companies:
             return "No companies"
         ranked = sorted(self.companies.values(), key=lambda c: c.value, reverse=True)
@@ -592,7 +588,6 @@ class Bot:
                 enforce_limit = self._check_ownership(pkt.id, co)
                 if enforce_limit:
                     self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
-
             self.log.debug(f"ClientInfo: #{pkt.id} '{pkt.name}' co={co}")
             if enforce_limit:
                 self._spawn(self._enforce_limit(pkt.id, co))
@@ -612,9 +607,7 @@ class Bot:
                     client.company_id = co
                 else:
                     self.clients[pkt.id] = Client(name=pkt.name, company_id=co)
-
                 enforce_limit = self._check_ownership(pkt.id, co)
-
                 if co == SPECTATOR_ID:
                     if pending := self.reset_pending.pop(pkt.id, None):
                         pending_co = pending[0]
@@ -703,8 +696,7 @@ class Bot:
         self.running = False
         for task in list(self.tasks):
             task.cancel()
-        if self.tasks:
-            await asyncio.gather(*self.tasks, return_exceptions=True)
+        await asyncio.gather(*self.tasks, return_exceptions=True)
         self.admin = None
 
     async def run(self) -> None:
@@ -752,9 +744,7 @@ class Bot:
                         self._pause_retry_at = 0.0
                         await self.apply_pause_policy()
 
-                    async with self._lock:
-                        paused = self.is_paused
-                    if not paused and now >= next_broadcast:
+                    if not self.is_paused and now >= next_broadcast:
                         await self.msg(self._leaderboard())
                         self.log.info("Broadcast leaderboard")
                         next_broadcast = now + BROADCAST_INTERVAL
