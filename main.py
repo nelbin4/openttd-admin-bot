@@ -244,9 +244,8 @@ class Bot:
         if not self.admin or self.admin._writer is None:
             return
         dest = ChatDestTypes.CLIENT if cid is not None else ChatDestTypes.BROADCAST
-        for line in text.split("\n"):
-            line = line.strip()
-            if line:
+        for raw in text.split("\n"):
+            if line := raw.strip():
                 try:
                     await self.admin._chat(line, Actions.SERVER_MESSAGE, dest, cid or 0)
                 except Exception as e:
@@ -418,7 +417,6 @@ class Bot:
             async with self._lock:
                 paused = self.is_paused
             if not paused:
-                self.log.debug("Poll: fetching company data")
                 await self._fetch_company_data()
 
     async def _reset_state(self) -> None:
@@ -490,11 +488,9 @@ class Bot:
         """Build top-10 company value leaderboard from cached data."""
         if not self.companies:
             return "No companies"
-        ranked = sorted(self.companies.items(), key=lambda x: x[1].value, reverse=True)[:10]
-        lines = ["=== Company Value Rankings ==="] + [
-            f"{i}. {d.name}: {fmt(d.value)}" for i, (_, d) in enumerate(ranked, 1)
-        ]
-        return "\n".join(lines)
+        ranked = sorted(self.companies.values(), key=lambda c: c.value, reverse=True)[:10]
+        return "\n".join(["=== Company Value Rankings ==="] +
+            [f"{i}. {d.name}: {fmt(d.value)}" for i, d in enumerate(ranked, 1)])
 
     async def handle_cmd(self, cid: int, text: str) -> None:
         """Dispatch !commands; blocked during pause and subject to per-client cooldown."""
@@ -611,14 +607,11 @@ class Bot:
 
             async with self._lock:
                 client = self.clients.get(pkt.id)
-                pkt_ip = getattr(pkt, "ip", None)
                 if client:
                     client.name = pkt.name
                     client.company_id = co
-                    if pkt_ip and pkt_ip != "0.0.0.0":
-                        client.ip = pkt_ip
                 else:
-                    self.clients[pkt.id] = Client(name=pkt.name, company_id=co, ip=pkt_ip or "0.0.0.0")
+                    self.clients[pkt.id] = Client(name=pkt.name, company_id=co)
 
                 enforce_limit = self._check_ownership(pkt.id, co)
 
@@ -780,7 +773,7 @@ async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
         try:
             await Bot(cfg, log).run()
             break
-        except (ConnectionRefusedError, ConnectionError, OSError, TimeoutError):
+        except (ConnectionError, OSError, TimeoutError):
             log.warning(f"Server [{addr}] unavailable, retrying in {RECONNECT_DELAY}s...")
             await asyncio.sleep(RECONNECT_DELAY)
         except Exception as e:
