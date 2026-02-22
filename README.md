@@ -9,7 +9,7 @@ Async Python bot for managing OpenTTD multiplayer servers. Handles auto-pause, g
 ## Features
 - Auto pause/unpause based on company presence
 - Goal tracking with winner announcement and automatic map reload
-- Auto-clean old low-value companies (configurable age + value thresholds, checked every 60s at :00)
+- Auto-clean low or stagnant performing companies
 - Company limit enforcement: max `MAX_COMPANIES_PER_IP` companies per client
 - Welcome messages with country detection, chat commands, leaderboard broadcasts
 - Self-service `!reset` with spectator confirmation timeout
