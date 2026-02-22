@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import configparser
 import json
 import logging
@@ -57,10 +58,9 @@ def load_config(path: str = "settings.cfg") -> list[dict[str, Any]]:
     servers = []
     for section in cfg.sections():
         entry: dict[str, Any] = {"name": section}
-        for key, value in cfg.items(section):
-            entry[key] = (int(value) if value.isdigit()
-                          else (value.lower() == "true" if value.lower() in ("true", "false")
-                                else value))
+        for key, val in cfg.items(section):
+            low = val.lower()
+            entry[key] = int(val) if val.isdigit() else (low == "true") if low in ("true", "false") else val
         servers.append(entry)
     return servers
 
@@ -72,8 +72,7 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     if not (isinstance(cfg.get("port"), int) and 1 <= cfg["port"] <= 65535):
         return [f"Invalid port: {cfg.get('port')}"]
 
-    raw = cfg.get("debug", False)
-    cfg["debug"] = raw if isinstance(raw, bool) else str(raw).lower() == "true"
+    cfg.setdefault("debug", False)
     cfg.setdefault("map", "")
 
     goal = cfg.get("goal", 0)
@@ -134,8 +133,18 @@ class Bot:
         t.add_done_callback(self.tasks.discard)
         return t
 
-    def _client_company_count(self, client_id: int) -> int:
-        return sum(1 for owner_id in self.company_owners.values() if owner_id == client_id)
+    def _pkt_cid(self, pkt: Any) -> int:
+        """Extract 1-based company ID from a client packet."""
+        return self._to_cid(getattr(pkt, "play_as", getattr(pkt, "company_id", SPECTATOR_ID)))
+
+    def _check_ownership(self, client_id: int, co: int) -> bool:
+        """Assign ownership or return True if limit enforcement needed. Must be called under _lock."""
+        if co == SPECTATOR_ID or co not in self.companies or co in self._enforcing or co in self.company_owners:
+            return False
+        if sum(1 for oid in self.company_owners.values() if oid == client_id) >= MAX_COMPANIES_PER_IP:
+            return True
+        self.company_owners[co] = client_id
+        return False
 
     def _remove_company(self, cid: int) -> bool:
         """Remove company and owner from cache. Returns True if it existed."""
@@ -164,22 +173,8 @@ class Bot:
         finally:
             self._drain_depth -= 1
 
-    async def _flush_after_cancel(self) -> None:
-        """Discard TCP buffer debris after task cancellation to preserve packet framing."""
-        if not self.admin or not getattr(self.admin, "_reader", None):
-            return
-        try:
-            while True:
-                try:
-                    await asyncio.wait_for(self.admin.recv(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    break
-        except Exception:
-            pass
-
     async def _snapshot_state(self) -> None:
-        """Poll date/clients/companies until a date packet arrives (10s timeout),
-        then drain and fetch initial company data."""
+        """Poll date/clients/companies until a date packet arrives, then drain."""
         loop = asyncio.get_running_loop()
         start = loop.time()
         while True:
@@ -188,9 +183,7 @@ class Bot:
             for cid in range(16):
                 await self._poll(AdminUpdateType.COMPANY_INFO, cid)
             await self._drain(timeout=0.2)
-            async with self._lock:
-                have_date = self.game_date != 0
-            if have_date or loop.time() - start > 10:
+            if self.game_date or loop.time() - start > 10:
                 break
         await self._drain(timeout=0.5)
         await self._fetch_company_data()
@@ -231,26 +224,20 @@ class Bot:
             result = "\n".join(buf)
             self.log.debug(f"RCON< {result[:200]}")
 
-            if console_wait and not any(console_wait.lower() in l.lower() for l in buf):
-                cw_deadline = loop.time() + console_timeout
-                while True:
-                    remaining = cw_deadline - loop.time()
-                    if remaining <= 0:
-                        self.log.warning(f"console_wait '{console_wait}' timed out for: {cmd}")
-                        break
+            cw = console_wait.lower() if console_wait else ""
+            if cw and not any(cw in l.lower() for l in buf):
+                cw_end = loop.time() + console_timeout
+                while (rem := cw_end - loop.time()) > 0:
                     try:
-                        pkts = await asyncio.wait_for(self.admin.recv(), timeout=min(remaining, 0.5))
+                        pkts = await asyncio.wait_for(self.admin.recv(), timeout=min(rem, 0.5))
                     except asyncio.TimeoutError:
-                        self.log.warning(f"console_wait '{console_wait}' timed out for: {cmd}")
                         break
-                    found = False
-                    for pkt in pkts:
-                        if not found and isinstance(pkt, openttdpacket.ConsolePacket) and console_wait.lower() in pkt.message.lower():
-                            found = True
-                        else:
-                            buffered.append(pkt)
-                    if found:
+                    if any(isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower() for p in pkts):
+                        buffered.extend(p for p in pkts if not (isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower()))
                         break
+                    buffered.extend(pkts)
+                else:
+                    self.log.warning(f"console_wait '{console_wait}' timed out for: {cmd}")
 
         for pkt in buffered:
             await self.admin.handle_packet(pkt)
@@ -270,12 +257,10 @@ class Bot:
                     self.log.error(f"msg error: {e}")
 
     async def apply_pause_policy(self) -> None:
-        """Pause when no companies exist; unpause on first company.
-        Reschedules via _pause_retry_at when server-side 1s rate-limit applies."""
+        """Pause when no companies exist; unpause on first company."""
         async with self._lock:
             should_pause = not self.companies
             if self.last_pause_cmd == should_pause:
-                self.is_paused = should_pause
                 return
             now = asyncio.get_running_loop().time()
             if not should_pause and now - self.last_cmd_time < 1.0:
@@ -424,9 +409,6 @@ class Bot:
             self._new_game_event.clear()
             await self.rcon(cmd)
             await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
-        except asyncio.CancelledError:
-            self.log.info("Goal reload cancelled")
-            raise
         except Exception as e:
             self.log.error(f"Map reload error: {e}")
 
@@ -445,7 +427,10 @@ class Bot:
             task.cancel()
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
-            await self._flush_after_cancel()
+            try:
+                await self._drain(0.1)
+            except Exception:
+                pass
 
         async with self._lock:
             self.companies.clear()
@@ -483,13 +468,9 @@ class Bot:
 
     async def greet(self, cid: int) -> None:
         """Wait up to GREETING_DELAY for ClientInfo then send welcome message."""
-        event = self._client_ready.get(cid)
-        if event:
-            try:
+        if event := self._client_ready.pop(cid, None):
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout=GREETING_DELAY)
-            except asyncio.TimeoutError:
-                pass
-        self._client_ready.pop(cid, None)
         if not self.running:
             return
         async with self._lock:
@@ -556,8 +537,7 @@ class Bot:
             self.log.error(f"Command !{cmd} error: {e}")
 
     async def _handle_reset(self, cid: int) -> None:
-        """Register voluntary company reset; prompt client to move to spectator.
-        reset_company fires in on_client_update once the spectator move is confirmed."""
+        """Register voluntary company reset; prompt client to move to spectator."""
         async with self._lock:
             co = self.clients.get(cid, Client("", SPECTATOR_ID)).company_id
             valid = co != SPECTATOR_ID
@@ -608,19 +588,13 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientInfoPacket)
         async def on_client_info(admin: Admin, pkt: openttdpacket.ClientInfoPacket) -> None:
-            co = self._to_cid(getattr(pkt, "play_as", getattr(pkt, "company_id", SPECTATOR_ID)))
-            enforce_limit = False
-
+            co = self._pkt_cid(pkt)
             async with self._lock:
                 pkt_ip = getattr(pkt, "ip", "0.0.0.0")
                 self.clients[pkt.id] = Client(name=pkt.name, company_id=co, ip=pkt_ip)
-                if co != SPECTATOR_ID and co in self.companies and co not in self._enforcing:
-                    if co not in self.company_owners:
-                        if self._client_company_count(pkt.id) >= MAX_COMPANIES_PER_IP:
-                            enforce_limit = True
-                            self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
-                        else:
-                            self.company_owners[co] = pkt.id
+                enforce_limit = self._check_ownership(pkt.id, co)
+                if enforce_limit:
+                    self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
 
             self.log.debug(f"ClientInfo: #{pkt.id} '{pkt.name}' co={co}")
             if enforce_limit:
@@ -630,7 +604,7 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientUpdatePacket)
         async def on_client_update(admin: Admin, pkt: openttdpacket.ClientUpdatePacket) -> None:
-            co = self._to_cid(getattr(pkt, "play_as", getattr(pkt, "company_id", SPECTATOR_ID)))
+            co = self._pkt_cid(pkt)
             enforce_limit = False
             pending_co: int | None = None
 
@@ -645,13 +619,7 @@ class Bot:
                 else:
                     self.clients[pkt.id] = Client(name=pkt.name, company_id=co, ip=pkt_ip or "0.0.0.0")
 
-                if (co != SPECTATOR_ID and co in self.companies
-                        and co not in self.company_owners and co not in self._enforcing):
-                    if self._client_company_count(pkt.id) >= MAX_COMPANIES_PER_IP:
-                        enforce_limit = True
-                    else:
-                        self.company_owners[co] = pkt.id
-                        self.log.debug(f"Client #{pkt.id} owns co#{co}")
+                enforce_limit = self._check_ownership(pkt.id, co)
 
                 if co == SPECTATOR_ID:
                     if pending := self.reset_pending.pop(pkt.id, None):
@@ -680,15 +648,12 @@ class Bot:
             async with self._lock:
                 self.clients.pop(client_id, None)
                 self.reset_pending.pop(client_id, None)
-                # Release ownership so reconnecting client can reclaim and limit re-applies.
-                orphaned = [co for co, oid in self.company_owners.items() if oid == client_id]
-                for co in orphaned:
-                    del self.company_owners[co]
+                self.company_owners = {co: oid for co, oid in self.company_owners.items() if oid != client_id}
             if event := self._client_ready.pop(client_id, None):
                 event.set()
             self.log.debug(f"Client #{client_id} disconnected")
 
-        @self.admin.add_handler(openttdpacket.CompanyInfoPacket, openttdpacket.CompanyNewPacket)
+        @self.admin.add_handler(openttdpacket.CompanyInfoPacket, openttdpacket.CompanyNewPacket, openttdpacket.CompanyUpdatePacket)
         async def on_company(admin: Admin, pkt: Any) -> None:
             cid = self._to_cid(pkt.id)
             name = getattr(pkt, "name", None)
@@ -703,14 +668,6 @@ class Bot:
                 self.companies[cid] = Company(name=name or "", founded=founded or 0)
             self.log.info(f"Company added: #{cid} '{name or 'Unnamed'}'")
             await self.apply_pause_policy()
-
-        @self.admin.add_handler(openttdpacket.CompanyUpdatePacket)
-        async def on_company_update(admin: Admin, pkt: openttdpacket.CompanyUpdatePacket) -> None:
-            cid = self._to_cid(pkt.id)
-            name = getattr(pkt, "name", None)
-            async with self._lock:
-                if cid in self.companies and name:
-                    self.companies[cid].name = name
 
         @self.admin.add_handler(openttdpacket.CompanyRemovePacket)
         async def on_company_remove(admin: Admin, pkt: openttdpacket.CompanyRemovePacket) -> None:
@@ -734,8 +691,8 @@ class Bot:
             self.log.info("New game detected")
             await self._reset_state()
             await self._snapshot_state()
-            await asyncio.sleep(1.0)        # wait for server to create co#1
-            await self._fetch_company_data() # refresh cache so co#1 is visible
+            await asyncio.sleep(1.0)
+            await self._fetch_company_data()
             await self._reset_company_1()
             await self.apply_pause_policy()
             self._spawn(self._poll_loop())
@@ -807,8 +764,6 @@ class Bot:
                         self.log.info("Broadcast leaderboard")
                         next_broadcast = now + BROADCAST_INTERVAL
 
-        except (ConnectionRefusedError, ConnectionError, OSError, TimeoutError):
-            raise
         except Exception as e:
             self.log.error(f"Bot run error: {e}", exc_info=True)
             raise
@@ -821,8 +776,6 @@ async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     while True:
         try:
             await Bot(cfg, log).run()
-            break
-        except KeyboardInterrupt:
             break
         except (ConnectionRefusedError, ConnectionError, OSError, TimeoutError):
             log.warning(f"Server [{addr}] unavailable, retrying in {RECONNECT_DELAY}s...")
@@ -851,23 +804,17 @@ async def main() -> None:
     log = logging.getLogger("[Main]")
     log.info("=== OpenTTD Admin Bot Starting ===")
 
-    tasks = []
+    valid = []
     for cfg in servers:
-        errs = normalize_config(cfg, log)
-        if errs:
-            for e in errs:
-                log.error(f"Config error [{cfg.get('name', '?')}]: {e}")
-            continue
-        tasks.append(asyncio.create_task(
-            run_bot(cfg, logging.getLogger(f"[{cfg.get('ip')}:{cfg.get('port')}]"))
-        ))
-
-    if not tasks:
+        if errs := normalize_config(cfg, log):
+            log.error(f"Config error [{cfg.get('name', '?')}]: {errs[0]}")
+        else:
+            valid.append(cfg)
+    if not valid:
         log.error("No valid servers; exiting.")
         return
-
-    log.info(f"Starting {len(tasks)} bot instance(s)")
-    await asyncio.gather(*tasks)
+    log.info(f"Starting {len(valid)} bot instance(s)")
+    await asyncio.gather(*(run_bot(c, logging.getLogger(f"[{c['ip']}:{c['port']}]")) for c in valid))
 
 if __name__ == "__main__":
     asyncio.run(main())
