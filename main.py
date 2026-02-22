@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import signal
+import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -15,16 +16,15 @@ from typing import Any
 from aiopyopenttdadmin import Admin, AdminUpdateType, AdminUpdateFrequency, openttdpacket
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
-MAX_COMPANIES_PER_IP  = 2       # Maximum number of companies per IP
-BROADCAST_INTERVAL    = 3600    # Seconds, Interval for broadcasting messages
-GREETING_DELAY        = 5       # Seconds, Delay before sending greeting message
-CHAT_COMMAND_COOLDOWN = 2       # Seconds, Delay before sending chat command
-RESET_CONFIRM_TIMEOUT = 15      # Seconds, Delay before resetting company confirmation
-RECONNECT_DELAY       = 30      # Seconds, Delay before reconnecting to the server
-
-MOVE_SETTLE_DELAY     = 0.5     # Seconds, Delay before moving to a new station and settling
-SPECTATOR_ID          = 255     # ID of the spectator company
-RCON_TIMEOUT          = 5       # Seconds, Timeout for RCON commands
+SPECTATOR_ID          = 255
+MAX_COMPANIES_PER_IP  = 2
+BROADCAST_INTERVAL    = 3600
+RCON_TIMEOUT          = 5
+GREETING_DELAY        = 5
+CHAT_COMMAND_COOLDOWN = 2
+RESET_CONFIRM_TIMEOUT = 15
+RECONNECT_DELAY       = 30
+MOVE_SETTLE_DELAY     = 0.5
 
 _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
@@ -137,6 +137,11 @@ class Bot:
     def _client_company_count(self, client_id: int) -> int:
         return sum(1 for owner_id in self.company_owners.values() if owner_id == client_id)
 
+    def _remove_company(self, cid: int) -> bool:
+        """Remove company and owner from cache. Returns True if it existed."""
+        self.company_owners.pop(cid, None)
+        return self.companies.pop(cid, None) is not None
+
     async def _poll(self, update_type: AdminUpdateType, data: int) -> None:
         """Send raw ADMIN_POLL packet."""
         payload = update_type.value.to_bytes(1, "little") + data.to_bytes(4, "little")
@@ -240,10 +245,10 @@ class Bot:
                         break
                     found = False
                     for pkt in pkts:
-                        if isinstance(pkt, openttdpacket.ConsolePacket) and console_wait.lower() in pkt.message.lower():
+                        if not found and isinstance(pkt, openttdpacket.ConsolePacket) and console_wait.lower() in pkt.message.lower():
                             found = True
-                            break
-                        buffered.append(pkt)
+                        else:
+                            buffered.append(pkt)
                     if found:
                         break
 
@@ -294,13 +299,13 @@ class Bot:
             self._pause_retry_at = asyncio.get_running_loop().time() + 2.0
 
     async def _reset_company_1(self) -> None:
-        """Delete default company #1 on map start if unoccupied."""
+        """Delete default company #1 if it is unoccupied and still named 'Unnamed'."""
         async with self._lock:
-            if 1 not in self.companies:
+            co1 = self.companies.get(1)
+            if not co1 or co1.name.lower() not in ("", "unnamed"):
                 return
-            has_clients = any(c.company_id == 1 for c in self.clients.values())
-        if has_clients:
-            return
+            if any(c.company_id == 1 for c in self.clients.values()):
+                return
         try:
             await self.rcon("reset_company 1", console_wait="Company deleted")
             self.log.info("Reset default company #1")
@@ -335,10 +340,10 @@ class Bot:
                     await asyncio.sleep(MOVE_SETTLE_DELAY)
                 await self.rcon(f"reset_company {cid}", console_wait="Company deleted")
                 async with self._lock:
-                    self.companies.pop(cid, None)
-                    self.company_owners.pop(cid, None)
+                    self._remove_company(cid)
                 self.log.info(f"Auto-clean: co#{cid} '{name}' age={age}yrs val={value}")
                 await self.msg(f"Company {name} auto-reset")
+                await self.apply_pause_policy()
             except Exception as e:
                 self.log.error(f"Auto-clean error co#{cid}: {e}")
             finally:
@@ -427,7 +432,6 @@ class Bot:
 
     async def _poll_loop(self) -> None:
         """Fetch company data at the top of every wall-clock minute (:00s)."""
-        import time
         while self.running:
             now = time.time()
             await asyncio.sleep(60 - now % 60)
@@ -556,7 +560,7 @@ class Bot:
         reset_company fires in on_client_update once the spectator move is confirmed."""
         async with self._lock:
             co = self.clients.get(cid, Client("", SPECTATOR_ID)).company_id
-            valid = co != SPECTATOR_ID and co in self.companies
+            valid = co != SPECTATOR_ID
             if valid:
                 token = asyncio.get_running_loop().time()
                 self.reset_pending[cid] = (co, token)
@@ -662,8 +666,7 @@ class Bot:
                 await self.rcon(f"reset_company {pending_co}", console_wait="Company deleted")
                 await self.msg(f"Company #{pending_co} reset", pkt.id)
                 async with self._lock:
-                    self.companies.pop(pending_co, None)
-                    self.company_owners.pop(pending_co, None)
+                    self._remove_company(pending_co)
                 self.log.info(f"Reset complete: co#{pending_co}")
                 await self.apply_pause_policy()
 
@@ -713,9 +716,8 @@ class Bot:
         async def on_company_remove(admin: Admin, pkt: openttdpacket.CompanyRemovePacket) -> None:
             cid = self._to_cid(pkt.id)
             async with self._lock:
-                removed = self.companies.pop(cid, None)
-                self.company_owners.pop(cid, None)
-            if removed is not None:
+                removed = self._remove_company(cid)
+            if removed:
                 self.log.info(f"Company removed: #{cid}")
                 await self.apply_pause_policy()
 
@@ -732,6 +734,8 @@ class Bot:
             self.log.info("New game detected")
             await self._reset_state()
             await self._snapshot_state()
+            await asyncio.sleep(1.0)        # wait for server to create co#1
+            await self._fetch_company_data() # refresh cache so co#1 is visible
             await self._reset_company_1()
             await self.apply_pause_policy()
             self._spawn(self._poll_loop())
