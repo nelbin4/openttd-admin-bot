@@ -202,40 +202,36 @@ class Bot:
             await self.admin.send_rcon(cmd)
             deadline = loop.time() + timeout
 
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise TimeoutError(f"RCON '{cmd}' timed out")
+            done = False
+            while not done and (rem := deadline - loop.time()) > 0:
                 try:
-                    pkts = await asyncio.wait_for(self.admin.recv(), timeout=remaining)
+                    for pkt in await asyncio.wait_for(self.admin.recv(), timeout=rem):
+                        if isinstance(pkt, openttdpacket.RconPacket):
+                            buf.append(pkt.response.strip())
+                        elif isinstance(pkt, openttdpacket.RconEndPacket):
+                            done = True
+                        else:
+                            buffered.append(pkt)
                 except asyncio.TimeoutError:
-                    raise TimeoutError(f"RCON '{cmd}' timed out")
-                done = False
-                for pkt in pkts:
-                    if isinstance(pkt, openttdpacket.RconPacket):
-                        buf.append(pkt.response.strip())
-                    elif isinstance(pkt, openttdpacket.RconEndPacket):
-                        done = True
-                    else:
-                        buffered.append(pkt)
-                if done:
                     break
+            
+            if not done:
+                raise TimeoutError(f"RCON '{cmd}' timed out")
 
             result = "\n".join(buf)
             self.log.debug(f"RCON< {result[:200]}")
 
-            cw = console_wait.lower() if console_wait else ""
+            cw = console_wait.lower()
             if cw and not any(cw in l.lower() for l in buf):
                 cw_end = loop.time() + console_timeout
                 while (rem := cw_end - loop.time()) > 0:
                     try:
                         pkts = await asyncio.wait_for(self.admin.recv(), timeout=min(rem, 0.5))
+                        buffered.extend(pkts)
+                        if any(isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower() for p in pkts):
+                            break
                     except asyncio.TimeoutError:
                         break
-                    if any(isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower() for p in pkts):
-                        buffered.extend(p for p in pkts if not (isinstance(p, openttdpacket.ConsolePacket) and cw in p.message.lower()))
-                        break
-                    buffered.extend(pkts)
                 else:
                     self.log.warning(f"console_wait '{console_wait}' timed out for: {cmd}")
 
@@ -771,7 +767,8 @@ class Bot:
                         next_broadcast = now + BROADCAST_INTERVAL
 
         except Exception as e:
-            self.log.error(f"Bot run error: {e}", exc_info=True)
+            if not isinstance(e, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
+                self.log.error(f"Bot run error: {e}", exc_info=True)
             raise
         finally:
             await self.cleanup()
