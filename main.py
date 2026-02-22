@@ -417,7 +417,11 @@ class Bot:
         while self.running:
             now = time.time()
             await asyncio.sleep(60 - now % 60)
-            if self.running:
+            if not self.running:
+                break
+            async with self._lock:
+                paused = self.is_paused
+            if not paused:
                 self.log.debug("Poll: fetching company data")
                 await self._fetch_company_data()
 
@@ -468,9 +472,10 @@ class Bot:
 
     async def greet(self, cid: int) -> None:
         """Wait up to GREETING_DELAY for ClientInfo then send welcome message."""
-        if event := self._client_ready.pop(cid, None):
+        if event := self._client_ready.get(cid):
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(event.wait(), timeout=GREETING_DELAY)
+        self._client_ready.pop(cid, None)
         if not self.running:
             return
         async with self._lock:
@@ -648,6 +653,7 @@ class Bot:
             async with self._lock:
                 self.clients.pop(client_id, None)
                 self.reset_pending.pop(client_id, None)
+                self.cooldowns.pop(client_id, None)
                 self.company_owners = {co: oid for co, oid in self.company_owners.items() if oid != client_id}
             if event := self._client_ready.pop(client_id, None):
                 event.set()
