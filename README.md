@@ -19,14 +19,14 @@ Async Python bot for managing OpenTTD multiplayer servers. Handles auto-pause, g
 ## Requirements
 - OpenTTD 14.0+ dedicated server with admin port enabled
 - Python 3.10+
-- `pip install pyopenttdadmin`
+- `pip install aiopyopenttdadmin`
 
 ## Quick Start
 ```bash
 git clone https://github.com/nelbin4/openttd-admin-bot.git
 cd openttd-admin-bot
 python -m venv venv && source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install pyopenttdadmin
+pip install aiopyopenttdadmin
 # Edit settings.cfg then:
 python main.py
 ```
@@ -40,11 +40,16 @@ docker run -d --name openttd-bot --restart unless-stopped \
 ```dockerfile
 FROM python:3.11-slim
 WORKDIR /app
-RUN pip install --no-cache-dir pyopenttdadmin
-COPY main.py settings.cfg ./
+RUN pip install --no-cache-dir aiopyopenttdadmin
+COPY main.py settings.cfg requirements.txt ./
 RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
 CMD ["python", "-u", "main.py"]
+```
+
+## requirements.txt
+```
+aiopyopenttdadmin
 ```
 
 ## Configuration — `settings.cfg`
@@ -54,13 +59,25 @@ ip = 127.0.0.1
 port = 3977
 admin_name = Admin
 admin_pass = password
-goal = 100000000        ; company value to win (0 = disabled)
-map = competitive.scn   ; map/scenario to load after goal (or "newgame")
-clean_age = 5           ; min company age in years for auto-clean
-clean_value = 100000    ; max company value for auto-clean (0 = disabled)
+map = competitive.sav
+goal = 100000000
+clean_age = 5
+clean_value = 100000
 debug = false
+
+# this is how to add more server, uncomment below
+#[server2]
+#ip = 127.0.0.1
+#port = 3978
+#admin_name = Admin
+#admin_pass = password
+#map = casual.scn
+#goal = 50000000
+#clean_age = 3
+#clean_value = 50000
+#debug = false
 ```
-Add `[server2]`, `[server3]`, etc. for additional servers.
+Add more servers by adding `[server3]`, `[server4]`, etc.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -73,6 +90,7 @@ Add `[server2]`, `[server3]`, etc. for additional servers.
 | `clean_age` | int | Minimum company age (years) to be eligible for auto-clean |
 | `clean_value` | int | Companies below this value get auto-cleaned |
 | `debug` | bool | Enable debug logging |
+Add `[server2]`, `[server3]`, etc. for additional servers.
 
 ## Chat Commands
 | Command | Description |
