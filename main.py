@@ -17,6 +17,10 @@ from typing import Any
 from aiopyopenttdadmin import Admin, AdminUpdateType, AdminUpdateFrequency, openttdpacket
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 SPECTATOR_ID          = 255
 MAX_COMPANIES_PER_IP  = 2
 BROADCAST_INTERVAL    = 3600
@@ -31,6 +35,10 @@ _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
 )
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Company:
     name: str = ""
@@ -42,6 +50,10 @@ class Client:
     name: str
     company_id: int
     ip: str = "0.0.0.0"
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 
 def fmt(value: int) -> str:
     """Format integer with b/m/k suffix."""
@@ -88,8 +100,14 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     log.info(f"[{cfg['name']}] goal:{cfg['goal']} map:{cfg['map'] or 'disabled'}")
     return []
 
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
 class Bot:
     """OpenTTD admin bot: enforces company limits, manages pause, goal, and auto-clean."""
+
+    # --- Init ---
 
     def __init__(self, cfg: dict[str, Any], log: logging.Logger) -> None:
         self.cfg, self.log = cfg, log
@@ -121,6 +139,8 @@ class Bot:
         self._drain_depth = 0
         self._country_cache: dict[str, str] = {}
 
+    # --- Cache helpers ---
+
     @staticmethod
     def _to_cid(raw: int) -> int:
         """0-based → 1-based company ID; 255 (spectator) unchanged."""
@@ -151,6 +171,8 @@ class Bot:
         self.company_owners.pop(cid, None)
         return self.companies.pop(cid, None) is not None
 
+    # --- Network primitives ---
+
     async def _poll(self, update_type: AdminUpdateType, data: int) -> None:
         """Send raw ADMIN_POLL packet."""
         payload = update_type.value.to_bytes(1, "little") + data.to_bytes(4, "little")
@@ -172,21 +194,6 @@ class Bot:
                     break
         finally:
             self._drain_depth -= 1
-
-    async def _snapshot_state(self) -> None:
-        """Poll date/clients/companies until a date packet arrives, then drain."""
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        while True:
-            await self._poll(AdminUpdateType.DATE, 0)
-            await self._poll(AdminUpdateType.CLIENT_INFO, 0xFFFFFFFF)
-            for cid in range(16):
-                await self._poll(AdminUpdateType.COMPANY_INFO, cid)
-            await self._drain(timeout=0.2)
-            if self.game_date or loop.time() - start > 10:
-                break
-        await self._drain(timeout=0.5)
-        await self._fetch_company_data()
 
     async def rcon(self, cmd: str, timeout: float = RCON_TIMEOUT,
                    console_wait: str = "", console_timeout: float = 5.0) -> str:
@@ -253,6 +260,65 @@ class Bot:
                 except Exception as e:
                     self.log.error(f"msg error: {e}")
 
+    # --- Connection lifecycle ---
+
+    async def _snapshot_state(self) -> None:
+        """Poll date/clients/companies until a date packet arrives, then drain."""
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while True:
+            await self._poll(AdminUpdateType.DATE, 0)
+            await self._poll(AdminUpdateType.CLIENT_INFO, 0xFFFFFFFF)
+            for cid in range(16):
+                await self._poll(AdminUpdateType.COMPANY_INFO, cid)
+            await self._drain(timeout=0.2)
+            if self.game_date or loop.time() - start > 10:
+                break
+        await self._drain(timeout=0.5)
+        await self._fetch_company_data()
+
+    async def _reset_state(self) -> None:
+        """Cancel all tasks, flush TCP debris, and clear all game state."""
+        for task in list(self.tasks):
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await self._drain(0.1)
+
+        async with self._lock:
+            self.companies.clear()
+            self.company_owners.clear()
+            self.clients.clear()
+            self.game_year = self.game_date = 0
+            self.is_paused = True
+            self.goal_reached = False
+            self.reset_pending.clear()
+            self.cooldowns.clear()
+            self._cleaning.clear()
+            self._enforcing.clear()
+            self.last_pause_cmd = None
+            self.last_cmd_time = 0.0
+            self._pause_retry_at = asyncio.get_running_loop().time() + 0.5
+
+        self._client_ready.clear()
+        self._drain_depth = 0
+
+    async def _reset_company_1(self) -> None:
+        """Delete default company #1 if it is unoccupied and still named 'Unnamed'."""
+        async with self._lock:
+            co1 = self.companies.get(1)
+            if not co1 or co1.name.lower() not in ("", "unnamed"):
+                return
+            if any(c.company_id == 1 for c in self.clients.values()):
+                return
+        try:
+            await self.rcon("reset_company 1", console_wait="Company deleted")
+            self.log.info("Reset default company #1")
+        except Exception as e:
+            self.log.debug(f"reset_company 1: {e}")
+
+    # --- Game logic ---
+
     async def apply_pause_policy(self) -> None:
         """Pause when no companies exist; unpause on first company."""
         async with self._lock:
@@ -280,22 +346,75 @@ class Bot:
             self.log.error(f"Pause policy error: {e}")
             self._pause_retry_at = asyncio.get_running_loop().time() + 2.0
 
-    async def _reset_company_1(self) -> None:
-        """Delete default company #1 if it is unoccupied and still named 'Unnamed'."""
-        async with self._lock:
-            co1 = self.companies.get(1)
-            if not co1 or co1.name.lower() not in ("", "unnamed"):
-                return
-            if any(c.company_id == 1 for c in self.clients.values()):
-                return
+    async def _poll_loop(self) -> None:
+        """Fetch company data at the top of every wall-clock minute (:00s)."""
+        while self.running:
+            await asyncio.sleep(60 - time.time() % 60)
+            if self.running and not self.is_paused:
+                self.log.debug("Poll: fetching company data")
+                await self._fetch_company_data()
+
+    async def _fetch_company_data(self) -> None:
+        """Fetch 'rcon companies', update cache, then check goal and auto-clean."""
         try:
-            await self.rcon("reset_company 1", console_wait="Company deleted")
-            self.log.info("Reset default company #1")
+            resp = await self.rcon("companies")
         except Exception as e:
-            self.log.debug(f"reset_company 1: {e}")
+            self.log.error(f"Company data fetch error: {e}")
+            return
+
+        updates: dict[int, Company] = {}
+        for line in resp.splitlines():
+            m = _RCON_COMPANY_RE.match(line.strip())
+            if m:
+                cid = int(m.group(1))
+                updates[cid] = Company(name=m.group(2), founded=int(m.group(3)), value=int(m.group(4)))
+
+        if not updates:
+            return
+
+        async with self._lock:
+            for cid, data in updates.items():
+                if cid not in self.companies:
+                    self.log.info(f"Recovered missing company #{cid} '{data.name}' from rcon")
+                self.companies[cid] = data
+
+        self.log.debug(f"Company data updated: {sorted(updates)}")
+        await self.check_goal()
+        await self.auto_clean()
+
+    async def check_goal(self) -> None:
+        """Spawn reload countdown if any company reached the goal value."""
+        goal = self.cfg.get("goal", 0)
+        if self.goal_reached or goal <= 0:
+            return
+        async with self._lock:
+            winner = next((d for d in self.companies.values() if d.value >= goal), None)
+            if not winner:
+                return
+            self.goal_reached = True
+            winner_name, winner_value = winner.name, winner.value
+        self.log.info(f"Goal reached: {winner_name} at {fmt(winner_value)}")
+        self._spawn(self._do_goal_reload(winner_name, goal))
+
+    async def _do_goal_reload(self, winner_name: str, goal: int) -> None:
+        """Announce win, countdown 20s, then load map."""
+        try:
+            await self.msg(f"========== Congratulations! {winner_name} WINS! ==========\n"
+                           f"Company reached {fmt(goal)}")
+            for t in (20, 15, 10, 5):
+                await self.msg(f"Map reloads in {t}s...")
+                await asyncio.sleep(5)
+            map_file = self.cfg.get("map", "")
+            cmd = "newgame" if not map_file or map_file == "newgame" else (
+                f"load_scenario {map_file}" if map_file.endswith(".scn") else f"load {map_file}")
+            self._new_game_event.clear()
+            await self.rcon(cmd)
+            await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
+        except Exception as e:
+            self.log.error(f"Map reload error: {e}")
 
     async def auto_clean(self) -> None:
-        """Reset old low-value companies. Moves clients first, settle, then resets."""
+        """Reset old low-value companies. Moves clients first, then resets."""
         age_thresh = self.cfg.get("clean_age", 0)
         val_thresh = self.cfg.get("clean_value", 0)
         if not age_thresh or not val_thresh:
@@ -350,98 +469,7 @@ class Bot:
             async with self._lock:
                 self._enforcing.discard(co)
 
-    async def check_goal(self) -> None:
-        """Spawn reload countdown if any company reached the goal value."""
-        goal = self.cfg.get("goal", 0)
-        if self.goal_reached or goal <= 0:
-            return
-        async with self._lock:
-            winner = next((d for d in self.companies.values() if d.value >= goal), None)
-            if not winner:
-                return
-            self.goal_reached = True
-            winner_name, winner_value = winner.name, winner.value
-        self.log.info(f"Goal reached: {winner_name} at {fmt(winner_value)}")
-        self._spawn(self._do_goal_reload(winner_name, goal))
-
-    async def _fetch_company_data(self) -> None:
-        """Fetch 'rcon companies', update cache, then check goal and auto-clean."""
-        try:
-            resp = await self.rcon("companies")
-        except Exception as e:
-            self.log.error(f"Company data fetch error: {e}")
-            return
-
-        updates: dict[int, Company] = {}
-        for line in resp.splitlines():
-            m = _RCON_COMPANY_RE.match(line.strip())
-            if m:
-                cid = int(m.group(1))
-                updates[cid] = Company(name=m.group(2), founded=int(m.group(3)), value=int(m.group(4)))
-
-        if not updates:
-            return
-
-        async with self._lock:
-            for cid, data in updates.items():
-                if cid not in self.companies:
-                    self.log.info(f"Recovered missing company #{cid} '{data.name}' from rcon")
-                self.companies[cid] = data
-
-        self.log.debug(f"Company data updated: {sorted(updates)}")
-        await self.check_goal()
-        await self.auto_clean()
-
-    async def _do_goal_reload(self, winner_name: str, goal: int) -> None:
-        """Announce win, countdown 20s, then load map."""
-        try:
-            await self.msg(f"========== Congratulations! {winner_name} WINS! ==========\n"
-                           f"Company reached {fmt(goal)}")
-            for t in (20, 15, 10, 5):
-                await self.msg(f"Map reloads in {t}s...")
-                await asyncio.sleep(5)
-            map_file = self.cfg.get("map", "")
-            cmd = "newgame" if not map_file or map_file == "newgame" else (
-                f"load_scenario {map_file}" if map_file.endswith(".scn") else f"load {map_file}")
-            self._new_game_event.clear()
-            await self.rcon(cmd)
-            await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
-        except Exception as e:
-            self.log.error(f"Map reload error: {e}")
-
-    async def _poll_loop(self) -> None:
-        """Fetch company data at the top of every wall-clock minute (:00s)."""
-        while self.running:
-            await asyncio.sleep(60 - time.time() % 60)
-            if self.running and not self.is_paused:
-                self.log.debug("Poll: fetching company data")
-                await self._fetch_company_data()
-
-    async def _reset_state(self) -> None:
-        """Cancel all tasks, flush TCP debris, and clear all game state."""
-        for task in list(self.tasks):
-            task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
-        with contextlib.suppress(Exception):
-            await self._drain(0.1)
-
-        async with self._lock:
-            self.companies.clear()
-            self.company_owners.clear()
-            self.clients.clear()
-            self.game_year = self.game_date = 0
-            self.is_paused = True
-            self.goal_reached = False
-            self.reset_pending.clear()
-            self.cooldowns.clear()
-            self._cleaning.clear()
-            self._enforcing.clear()
-            self.last_pause_cmd = None
-            self.last_cmd_time = 0.0
-            self._pause_retry_at = asyncio.get_running_loop().time() + 0.5
-
-        self._client_ready.clear()
-        self._drain_depth = 0
+    # --- Player interaction ---
 
     async def _get_country(self, ip: str) -> str:
         """Resolve IP to country name via ipapi.co; returns '' for local/unknown. Cached."""
@@ -475,13 +503,12 @@ class Bot:
             return
         country = await self._get_country(ip)
         location = f" from {country}" if country else ""
-        suffix = ", create a company to unpause game" if paused else ""
         await self.msg(f"Welcome {name}{location}")
-        hint = f"{suffix.lstrip(', ')}, type !help for commands" if suffix else "type !help for commands"
+        hint = "create a company to unpause game, type !help for commands" if paused else "type !help for commands"
         await self.msg(hint, cid)
 
     def _leaderboard(self) -> str:
-        """Build top-10 company value leaderboard from cached data."""
+        """Build company value leaderboard from cached data."""
         if not self.companies:
             return "No companies"
         ranked = sorted(self.companies.values(), key=lambda c: c.value, reverse=True)
@@ -554,6 +581,8 @@ class Bot:
             await self.msg(f"Reset timeout after {RESET_CONFIRM_TIMEOUT}s", cid)
 
         self._spawn(_timeout(token))
+
+    # --- Event handlers ---
 
     def _setup_handlers(self) -> None:
 
@@ -691,6 +720,8 @@ class Bot:
             self.running = False
             self.log.info("Server shutdown")
 
+    # --- Entry points ---
+
     async def cleanup(self) -> None:
         """Cancel all tasks; Admin connection is closed by async-with in run()."""
         self.running = False
@@ -755,6 +786,10 @@ class Bot:
             raise
         finally:
             await self.cleanup()
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     """Run bot with automatic reconnect on connection failures."""
