@@ -82,26 +82,26 @@ class Bot:
         self.admin: Admin | None = None
         self.running = False
         self._lock = asyncio.Lock()
-        self.companies: dict[int, Company] = {}
-        self.company_owners: dict[int, int] = {}
-        self.clients: dict[int, Client] = {}
+        self.companies = {}
+        self.company_owners = {}
+        self.clients = {}
         self.game_year = 0
         self.game_date = 0
         self.is_paused = True
         self.goal_reached = False
-        self.cooldowns: dict[int, float] = {}
-        self.reset_pending: dict[int, tuple[int, float]] = {}
-        self._cleaning: set[int] = set()
-        self._enforcing: set[int] = set()
+        self.cooldowns = {}
+        self.reset_pending = {}
+        self._cleaning = set()
+        self._enforcing = set()
         self.last_pause_cmd: bool | None = None
         self.last_cmd_time = 0.0
         self._pause_retry_at: float = 0.0
-        self.tasks: set[asyncio.Task] = set()
-        self._client_ready: dict[int, asyncio.Event] = {}
+        self.tasks = set()
+        self._client_ready = {}
         self._new_game_event = asyncio.Event()
         self._rcon_lock = asyncio.Lock()
         self._drain_depth = 0
-        self._country_cache: dict[str, str] = {}
+        self._country_cache = {}
 
     @staticmethod
     def _to_cid(raw: int) -> int:
@@ -123,7 +123,7 @@ class Bot:
         """Assign ownership if new; return True if client exceeded max_companies limit. Call under _lock."""
         if co == 255 or co not in self.companies or co in self._enforcing or co in self.company_owners:
             return False
-        if list(self.company_owners.values()).count(client_id) >= self.cfg.get("max_companies", 2):
+        if sum(v == client_id for v in self.company_owners.values()) >= self.cfg.get("max_companies", 2):
             return True
         self.company_owners[co] = client_id
         return False
@@ -279,13 +279,10 @@ class Bot:
             self.is_paused = should_pause
             self.last_cmd_time = now
             self.last_pause_cmd = should_pause
-        state = "pause" if should_pause else "unpause"
         try:
-            resp = await self.rcon(state)
-            label = "paused" if should_pause else "unpaused"
-            if f"already {label}" not in resp.lower():
-                reason = "no companies" if should_pause else "company present"
-                self.log.info(f"{label.capitalize()}: {reason}")
+            resp = await self.rcon("pause" if should_pause else "unpause")
+            if f"already {'paused' if should_pause else 'unpaused'}" not in resp.lower():
+                self.log.info("Paused: no companies" if should_pause else "Unpaused: company present")
         except Exception as e:
             async with self._lock:
                 if self.last_pause_cmd == should_pause:
@@ -331,8 +328,8 @@ class Bot:
             if not winner:
                 return
             self.goal_reached = True
-            winner_name = winner.name
-        self.log.info(f"Goal reached: {winner_name} at {fmt(winner.value)}")
+            winner_name, winner_value = winner.name, winner.value
+        self.log.info(f"Goal reached: {winner_name} at {fmt(winner_value)}")
         self._spawn(self._do_goal_reload(winner_name, goal))
 
     async def _do_goal_reload(self, winner_name: str, goal: int) -> None:
@@ -356,7 +353,7 @@ class Bot:
         """Reset old low-value companies. Moves clients first, then resets."""
         age_thresh = self.cfg.get("clean_age", 0)
         val_thresh = self.cfg.get("clean_value", 0)
-        if not age_thresh or not val_thresh:
+        if not (age_thresh and val_thresh):
             return
         async with self._lock:
             pending_cos = {co for co, _ in self.reset_pending.values()}
@@ -367,13 +364,12 @@ class Bot:
                         or self.game_year - d.founded < age_thresh):
                     continue
                 clients = [c for c, cd in self.clients.items() if cd.company_id == cid]
-                to_clean.append((cid, d.name, d.value, d.founded, clients))
+                to_clean.append((cid, d.name, d.value, self.game_year - d.founded, clients))
                 self._cleaning.add(cid)
-        for cid, name, value, founded, clients in to_clean:
-            age = self.game_year - founded
+        for cid, name, value, age, clients in to_clean:
             try:
                 for c in clients:
-                    await self.rcon(f"move {c} {255}", console_wait="has joined spectators")
+                    await self.rcon(f"move {c} 255", console_wait="has joined spectators")
                 if clients:
                     await asyncio.sleep(0.5)
                 await self.rcon(f"reset_company {cid}", console_wait="Company deleted")
@@ -396,7 +392,7 @@ class Bot:
             client_name = getattr(self.clients.get(cid), "name", "")
         try:
             await asyncio.sleep(1.0)
-            await self.rcon(f"move {cid} {255}", console_wait="has joined spectators")
+            await self.rcon(f"move {cid} 255", console_wait="has joined spectators")
             await self.rcon(f"reset_company {co}")
             await self.msg(f"Only {self.cfg.get('max_companies', 2)} companies per client allowed.", cid)
             self.log.info(f"Enforced limit: moved '{client_name}' to spectator, reset co#{co}")
@@ -413,10 +409,9 @@ class Bot:
         if ip in self._country_cache:
             return self._country_cache[ip]
         try:
-            def _fetch():
-                with urllib.request.urlopen(f"https://ipapi.co/{ip}/json/", timeout=5) as r:
-                    return json.load(r).get("country_name", "") or ""
-            country = await asyncio.get_running_loop().run_in_executor(None, _fetch)
+            country = await asyncio.get_running_loop().run_in_executor(None,
+                lambda: (lambda r: json.load(r).get("country_name", "") or "")
+                (urllib.request.urlopen(f"https://ipapi.co/{ip}/json/", timeout=5)))
         except Exception:
             country = ""
         self._country_cache[ip] = country
@@ -435,8 +430,7 @@ class Bot:
                 return
             name, ip, paused = client.name, client.ip, self.is_paused
         country = await self._get_country(ip)
-        location = f" from {country}" if country else ""
-        await self.msg(f"Welcome {name}{location}")
+        await self.msg(f"Welcome {name}" + (f" from {country}" if country else ""))
         hint = "create a company to unpause game, type !help for commands" if paused else "type !help for commands"
         await self.msg(hint, cid)
 
@@ -492,14 +486,14 @@ class Bot:
         """Register voluntary company reset; prompt client to move to spectator."""
         token = asyncio.get_running_loop().time()
         async with self._lock:
-            co = self.clients.get(cid, Client("", 255)).company_id
+            co = getattr(self.clients.get(cid), "company_id", 255)
             if co != 255:
                 self.reset_pending[cid] = (co, token)
         if co == 255:
             await self.msg("You must be in a company", cid)
             return
         self.log.info(f"Reset request: client #{cid} co#{co}")
-        await self.msg(f"Move to spectator in {15}s to reset company", cid)
+        await self.msg("Move to spectator in 15s to reset company", cid)
 
         async def _timeout(tok: float) -> None:
             await asyncio.sleep(15)
@@ -507,7 +501,7 @@ class Bot:
                 if self.reset_pending.get(cid, (None, None))[1] != tok:
                     return
                 self.reset_pending.pop(cid, None)
-            await self.msg(f"Reset timeout after {15}s", cid)
+            await self.msg("Reset timeout after 15s", cid)
         self._spawn(_timeout(token))
 
     def _setup_handlers(self) -> None:
@@ -647,14 +641,10 @@ class Bot:
             async with Admin(ip=self.cfg["ip"], port=self.cfg["port"]) as admin:
                 self.admin = admin
                 await admin.login(self.cfg["admin_name"], self.cfg["admin_pass"])
-                for update, freq in (
-                    (AdminUpdateType.CHAT,         AdminUpdateFrequency.AUTOMATIC),
-                    (AdminUpdateType.CLIENT_INFO,  AdminUpdateFrequency.AUTOMATIC),
-                    (AdminUpdateType.CONSOLE,      AdminUpdateFrequency.AUTOMATIC),
-                    (AdminUpdateType.COMPANY_INFO, AdminUpdateFrequency.AUTOMATIC),
-                    (AdminUpdateType.DATE,         AdminUpdateFrequency.MONTHLY),
-                ):
-                    await admin.subscribe(update, freq)
+                for u in (AdminUpdateType.CHAT, AdminUpdateType.CLIENT_INFO,
+                          AdminUpdateType.CONSOLE, AdminUpdateType.COMPANY_INFO):
+                    await admin.subscribe(u, AdminUpdateFrequency.AUTOMATIC)
+                await admin.subscribe(AdminUpdateType.DATE, AdminUpdateFrequency.MONTHLY)
                 self._setup_handlers()
                 await self._snapshot_state()
                 await self._reset_company_1()
@@ -664,7 +654,8 @@ class Bot:
                 await self.msg("Admin connected")
                 self._spawn(self._poll_loop())
                 loop = asyncio.get_running_loop()
-                next_broadcast = loop.time() + self.cfg.get("broadcast_cv", 3600)
+                bcast = self.cfg.get("broadcast_cv", 3600)
+                next_broadcast = loop.time() + bcast
                 while self.running:
                     try:
                         async with self._rcon_lock:
@@ -680,7 +671,7 @@ class Bot:
                     if not self.is_paused and now >= next_broadcast:
                         await self.msg(self._leaderboard())
                         self.log.info("Broadcast leaderboard")
-                        next_broadcast = now + self.cfg.get("broadcast_cv", 3600)
+                        next_broadcast = now + bcast
         except Exception as e:
             if not isinstance(e, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
                 self.log.error(f"Bot run error: {e}", exc_info=True)
@@ -694,9 +685,9 @@ async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     while True:
         try:
             await Bot(cfg, log).run()
-            log.info(f"[{addr}] disconnected, reconnecting in {30}s...")
+            log.info(f"[{addr}] disconnected, reconnecting in 30s...")
         except (ConnectionError, OSError, TimeoutError):
-            log.warning(f"[{addr}] unavailable, retrying in {30}s...")
+            log.warning(f"[{addr}] unavailable, retrying in 30s...")
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
         await asyncio.sleep(30)
