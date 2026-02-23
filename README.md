@@ -97,7 +97,7 @@ Add more servers by adding `[server3]`, `[server4]`, etc.
 | `max_companies` | int | Maximum number of companies per client allowed |
 | `broadcast_cv` | int | Interval in seconds for company value leaderboard broadcasts |
 | `debug` | bool | Enable debug logging |
-Add `[server2]`, `[server3]`, etc. for additional servers.
+
 
 ## Chat Commands
 | Command | Description |
