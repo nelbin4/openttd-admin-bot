@@ -17,9 +17,8 @@ from typing import Any
 from aiopyopenttdadmin import Admin, AdminUpdateType, AdminUpdateFrequency, openttdpacket
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
-# ---------------------------------------------------------------------------
+# ---
 # Constants
-# ---------------------------------------------------------------------------
 
 SPECTATOR_ID          = 255
 MAX_COMPANIES_PER_IP  = 2
@@ -35,9 +34,8 @@ _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
 )
 
-# ---------------------------------------------------------------------------
+# ---
 # Data classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Company:
@@ -51,9 +49,8 @@ class Client:
     company_id: int
     ip: str = "0.0.0.0"
 
-# ---------------------------------------------------------------------------
+# ---
 # Config helpers
-# ---------------------------------------------------------------------------
 
 def fmt(value: int) -> str:
     """Format integer with b/m/k suffix."""
@@ -69,7 +66,7 @@ def load_config(path: str = "settings.cfg") -> list[dict[str, Any]]:
         raise FileNotFoundError(f"Config file not found: {path}")
     servers = []
     for section in cfg.sections():
-        entry: dict[str, Any] = {"name": section}
+        entry = {"name": section}
         for key, val in cfg.items(section):
             low = val.lower()
             entry[key] = int(val) if val.isdigit() else (low == "true") if low in ("true", "false") else val
@@ -100,9 +97,8 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     log.info(f"[{cfg['name']}] goal:{cfg['goal']} map:{cfg['map'] or 'disabled'}")
     return []
 
-# ---------------------------------------------------------------------------
+# ---
 # Bot
-# ---------------------------------------------------------------------------
 
 class Bot:
     """OpenTTD admin bot: enforces company limits, manages pause, goal, and auto-clean."""
@@ -161,7 +157,7 @@ class Bot:
         """Assign ownership or return True if limit enforcement needed. Must be called under _lock."""
         if co == SPECTATOR_ID or co not in self.companies or co in self._enforcing or co in self.company_owners:
             return False
-        if sum(1 for oid in self.company_owners.values() if oid == client_id) >= MAX_COMPANIES_PER_IP:
+        if list(self.company_owners.values()).count(client_id) >= MAX_COMPANIES_PER_IP:
             return True
         self.company_owners[co] = client_id
         return False
@@ -279,8 +275,7 @@ class Bot:
 
     async def _reset_state(self) -> None:
         """Cancel all tasks, flush TCP debris, and clear all game state."""
-        for task in list(self.tasks):
-            task.cancel()
+        for t in self.tasks: t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         with contextlib.suppress(Exception):
             await self._drain(0.1)
@@ -334,11 +329,13 @@ class Bot:
             self.last_cmd_time = now
             self.last_pause_cmd = should_pause
 
-        cmd = "pause" if should_pause else "unpause"
+        state = "pause" if should_pause else "unpause"
         try:
-            resp = await self.rcon(cmd)
-            if f"already {'paused' if should_pause else 'unpaused'}" not in resp.lower():
-                self.log.info(f"{'Paused' if should_pause else 'Unpaused'}: {'no companies' if should_pause else 'company present'}")
+            resp = await self.rcon(state)
+            label = "paused" if should_pause else "unpaused"
+            if f"already {label}" not in resp.lower():
+                reason = "no companies" if should_pause else "company present"
+                self.log.info(f"{label.capitalize()}: {reason}")
         except Exception as e:
             async with self._lock:
                 if self.last_pause_cmd == should_pause:
@@ -422,18 +419,18 @@ class Bot:
 
         async with self._lock:
             pending_cos = {co for co, _ in self.reset_pending.values()}
-            to_clean: list[tuple[int, str, int, list[int]]] = []
+            to_clean = []
             for cid, d in self.companies.items():
                 if (not d.founded or d.value >= val_thresh
                         or cid in self._cleaning or cid in pending_cos
                         or self.game_year - d.founded < age_thresh):
                     continue
                 clients = [c for c, cd in self.clients.items() if cd.company_id == cid]
-                to_clean.append((cid, d.name, d.value, clients))
+                to_clean.append((cid, d.name, d.value, d.founded, clients))
                 self._cleaning.add(cid)
 
-        for cid, name, value, clients in to_clean:
-            age = self.game_year - self.companies.get(cid, Company()).founded
+        for cid, name, value, founded, clients in to_clean:
+            age = self.game_year - founded
             try:
                 for c in clients:
                     await self.rcon(f"move {c} {SPECTATOR_ID}", console_wait="has joined spectators")
@@ -558,14 +555,13 @@ class Bot:
 
     async def _handle_reset(self, cid: int) -> None:
         """Register voluntary company reset; prompt client to move to spectator."""
+        token = asyncio.get_running_loop().time()
         async with self._lock:
             co = self.clients.get(cid, Client("", SPECTATOR_ID)).company_id
-            valid = co != SPECTATOR_ID
-            if valid:
-                token = asyncio.get_running_loop().time()
+            if co != SPECTATOR_ID:
                 self.reset_pending[cid] = (co, token)
 
-        if not valid:
+        if co == SPECTATOR_ID:
             await self.msg("You must be in a company", cid)
             return
 
@@ -590,17 +586,15 @@ class Bot:
         async def on_console(admin: Admin, pkt: openttdpacket.ConsolePacket) -> None:
             msg = pkt.message.strip().lower()
             self.log.debug(f"[Console] {msg}")
-            async with self._lock:
-                if "game paused" in msg:
-                    self.is_paused = True
-                elif "unpaused" in msg:
-                    self.is_paused = False
+            if "game paused" in msg:
+                self.is_paused = True
+            elif "unpaused" in msg:
+                self.is_paused = False
 
         @self.admin.add_handler(openttdpacket.ChatPacket)
         async def on_chat(admin: Admin, pkt: openttdpacket.ChatPacket) -> None:
             msg = pkt.message.strip()
-            client_id = getattr(pkt, "id", None)
-            if msg.startswith("!") and client_id is not None:
+            if msg.startswith("!") and (client_id := getattr(pkt, "id", None)) is not None:
                 await self.handle_cmd(client_id, msg[1:])
 
         @self.admin.add_handler(openttdpacket.ClientJoinPacket)
@@ -612,12 +606,11 @@ class Bot:
         async def on_client_info(admin: Admin, pkt: openttdpacket.ClientInfoPacket) -> None:
             co = self._pkt_cid(pkt)
             async with self._lock:
-                pkt_ip = getattr(pkt, "ip", "0.0.0.0")
-                self.clients[pkt.id] = Client(name=pkt.name, company_id=co, ip=pkt_ip)
+                self.clients[pkt.id] = Client(name=pkt.name, company_id=co, ip=getattr(pkt, "ip", "0.0.0.0"))
                 enforce_limit = self._check_ownership(pkt.id, co)
-                if enforce_limit:
-                    self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
             self.log.debug(f"ClientInfo: #{pkt.id} '{pkt.name}' co={co}")
+            if enforce_limit:
+                self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
             if enforce_limit:
                 self._spawn(self._enforce_limit(pkt.id, co))
             if event := self._client_ready.get(pkt.id):
@@ -627,7 +620,7 @@ class Bot:
         async def on_client_update(admin: Admin, pkt: openttdpacket.ClientUpdatePacket) -> None:
             co = self._pkt_cid(pkt)
             enforce_limit = False
-            pending_co: int | None = None
+            pending_co = None
 
             async with self._lock:
                 client = self.clients.get(pkt.id)
@@ -656,8 +649,7 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         async def on_client_disconnect(admin: Admin, pkt: Any) -> None:
-            client_id = getattr(pkt, "id", None)
-            if client_id is None:
+            if (client_id := getattr(pkt, "id", None)) is None:
                 return
             if isinstance(pkt, openttdpacket.ClientErrorPacket):
                 self.log.debug(f"[ClientError] #{client_id}: {getattr(pkt, 'error', '?')}")
@@ -725,8 +717,7 @@ class Bot:
     async def cleanup(self) -> None:
         """Cancel all tasks; Admin connection is closed by async-with in run()."""
         self.running = False
-        for task in list(self.tasks):
-            task.cancel()
+        for t in self.tasks: t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.admin = None
 
@@ -787,9 +778,8 @@ class Bot:
         finally:
             await self.cleanup()
 
-# ---------------------------------------------------------------------------
+# ---
 # Entry point
-# ---------------------------------------------------------------------------
 
 async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     """Run bot with automatic reconnect on connection failures."""
@@ -797,13 +787,12 @@ async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     while True:
         try:
             await Bot(cfg, log).run()
-            break
+            log.info(f"[{addr}] disconnected, reconnecting in {RECONNECT_DELAY}s...")
         except (ConnectionError, OSError, TimeoutError):
-            log.warning(f"Server [{addr}] unavailable, retrying in {RECONNECT_DELAY}s...")
-            await asyncio.sleep(RECONNECT_DELAY)
+            log.warning(f"[{addr}] unavailable, retrying in {RECONNECT_DELAY}s...")
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
-            await asyncio.sleep(RECONNECT_DELAY)
+        await asyncio.sleep(RECONNECT_DELAY)
 
 async def main() -> None:
     """Load settings.cfg, configure logging, launch one bot task per server."""
