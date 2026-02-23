@@ -17,9 +17,7 @@ from typing import Any
 from aiopyopenttdadmin import Admin, AdminUpdateType, AdminUpdateFrequency, openttdpacket
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
-# ---
 # Constants
-
 SPECTATOR_ID          = 255
 MAX_COMPANIES_PER_IP  = 2
 BROADCAST_INTERVAL    = 3600
@@ -34,9 +32,7 @@ _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
 )
 
-# ---
 # Data classes
-
 @dataclass
 class Company:
     name: str = ""
@@ -49,9 +45,7 @@ class Client:
     company_id: int
     ip: str = "0.0.0.0"
 
-# ---
 # Config helpers
-
 def fmt(value: int) -> str:
     """Format integer with b/m/k suffix."""
     for threshold, suffix in [(1_000_000_000, "b"), (1_000_000, "m"), (1_000, "k")]:
@@ -96,13 +90,9 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     log.info(f"[{cfg['name']}] goal:{cfg['goal']} map:{cfg['map'] or 'disabled'}")
     return []
 
-# ---
 # Bot
-
 class Bot:
     """OpenTTD admin bot: enforces company limits, manages pause, goal, and auto-clean."""
-
-    # --- Init ---
 
     def __init__(self, cfg: dict[str, Any], log: logging.Logger) -> None:
         self.cfg, self.log = cfg, log
@@ -134,8 +124,6 @@ class Bot:
         self._drain_depth = 0
         self._country_cache: dict[str, str] = {}
 
-    # --- Cache helpers ---
-
     @staticmethod
     def _to_cid(raw: int) -> int:
         """0-based → 1-based company ID; 255 (spectator) unchanged."""
@@ -165,8 +153,6 @@ class Bot:
         """Remove company and owner from cache. Returns True if it existed."""
         self.company_owners.pop(cid, None)
         return self.companies.pop(cid, None) is not None
-
-    # --- Network primitives ---
 
     async def _poll(self, update_type: AdminUpdateType, data: int) -> None:
         """Send raw ADMIN_POLL packet."""
@@ -254,8 +240,6 @@ class Bot:
                 except Exception as e:
                     self.log.error(f"msg error: {e}")
 
-    # --- Connection lifecycle ---
-
     async def _snapshot_state(self) -> None:
         """Poll date/clients/companies until a date packet arrives, then drain."""
         loop = asyncio.get_running_loop()
@@ -310,8 +294,6 @@ class Bot:
             self.log.info("Reset default company #1")
         except Exception as e:
             self.log.debug(f"reset_company 1: {e}")
-
-    # --- Game logic ---
 
     async def apply_pause_policy(self) -> None:
         """Pause when no companies exist; unpause on first company."""
@@ -465,8 +447,6 @@ class Bot:
             async with self._lock:
                 self._enforcing.discard(co)
 
-    # --- Player interaction ---
-
     async def _get_country(self, ip: str) -> str:
         """Resolve IP to country name via ipapi.co; returns '' for local/unknown. Cached."""
         if not ip or ip in ("127.0.0.1", "0.0.0.0"):
@@ -576,8 +556,6 @@ class Bot:
             await self.msg(f"Reset timeout after {RESET_CONFIRM_TIMEOUT}s", cid)
 
         self._spawn(_timeout(token))
-
-    # --- Event handlers ---
 
     def _setup_handlers(self) -> None:
 
@@ -708,8 +686,6 @@ class Bot:
             self.running = False
             self.log.info("Server shutdown")
 
-    # --- Entry points ---
-
     async def cleanup(self) -> None:
         """Cancel all tasks; Admin connection is closed by async-with in run()."""
         self.running = False
@@ -774,9 +750,7 @@ class Bot:
         finally:
             await self.cleanup()
 
-# ---
 # Entry point
-
 async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     """Run bot with automatic reconnect on connection failures."""
     addr = f"{cfg['ip']}:{cfg['port']}"
