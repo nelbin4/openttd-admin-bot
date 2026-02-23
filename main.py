@@ -84,9 +84,8 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     cfg.setdefault("debug", False)
     cfg.setdefault("map", "")
 
-    goal = cfg.get("goal", 0)
-    cfg["goal"] = goal if isinstance(goal, int) and goal > 0 else 0
-    if cfg["goal"] == 0:
+    cfg["goal"] = g if isinstance(g := cfg.get("goal", 0), int) and g > 0 else 0
+    if not cfg["goal"]:
         cfg["map"] = ""
 
     age, val = cfg.get("clean_age", 0), cfg.get("clean_value", 0)
@@ -197,8 +196,7 @@ class Bot:
         if not self.admin:
             raise RuntimeError("rcon called with no active connection")
         self.log.debug(f"RCON> {cmd}")
-        buf: list[str] = []
-        buffered: list[Any] = []
+        buf, buffered = [], []
 
         async with self._rcon_lock:
             loop = asyncio.get_running_loop()
@@ -280,6 +278,7 @@ class Bot:
         with contextlib.suppress(Exception):
             await self._drain(0.1)
 
+        retry_at = asyncio.get_running_loop().time() + 0.5
         async with self._lock:
             self.companies.clear()
             self.company_owners.clear()
@@ -293,7 +292,7 @@ class Bot:
             self._enforcing.clear()
             self.last_pause_cmd = None
             self.last_cmd_time = 0.0
-            self._pause_retry_at = asyncio.get_running_loop().time() + 0.5
+            self._pause_retry_at = retry_at
 
         self._client_ready.clear()
         self._drain_depth = 0
@@ -359,7 +358,7 @@ class Bot:
             self.log.error(f"Company data fetch error: {e}")
             return
 
-        updates: dict[int, Company] = {}
+        updates = {}
         for line in resp.splitlines():
             m = _RCON_COMPANY_RE.match(line.strip())
             if m:
@@ -475,7 +474,7 @@ class Bot:
         if ip in self._country_cache:
             return self._country_cache[ip]
         try:
-            def _fetch() -> str:
+            def _fetch():
                 with urllib.request.urlopen(f"https://ipapi.co/{ip}/json/", timeout=5) as r:
                     return json.load(r).get("country_name", "") or ""
             country = await asyncio.get_running_loop().run_in_executor(None, _fetch)
@@ -611,7 +610,6 @@ class Bot:
             self.log.debug(f"ClientInfo: #{pkt.id} '{pkt.name}' co={co}")
             if enforce_limit:
                 self.log.warning(f"Client #{pkt.id} exceeded limit on ClientInfo, co#{co}")
-            if enforce_limit:
                 self._spawn(self._enforce_limit(pkt.id, co))
             if event := self._client_ready.get(pkt.id):
                 event.set()
@@ -668,11 +666,9 @@ class Bot:
             name = getattr(pkt, "name", None)
             founded = pkt.year if isinstance(getattr(pkt, "year", None), int) else None
             async with self._lock:
-                if cid in self.companies:
-                    if name:
-                        self.companies[cid].name = name
-                    if founded is not None:
-                        self.companies[cid].founded = founded
+                if co := self.companies.get(cid):
+                    if name: co.name = name
+                    if founded is not None: co.founded = founded
                     return
                 self.companies[cid] = Company(name=name or "", founded=founded or 0)
             self.log.info(f"Company added: #{cid} '{name or 'Unnamed'}'")
