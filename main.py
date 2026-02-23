@@ -77,7 +77,7 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     if not cfg["goal"]:
         cfg["map"] = ""
     age, val = cfg.get("clean_age", 0), cfg.get("clean_value", 0)
-    if not (isinstance(age, int) and age > 0 and isinstance(val, int) and val > 0):
+    if not all(isinstance(x, int) and x > 0 for x in (age, val)):
         cfg["clean_age"] = cfg["clean_value"] = 0
         log.info("auto-clean disabled")
     log.info(f"[{cfg['name']}] goal:{cfg['goal']} map:{cfg['map'] or 'disabled'}")
@@ -266,9 +266,7 @@ class Bot:
         """Delete default company #1 if it is unoccupied and still named 'Unnamed'."""
         async with self._lock:
             co1 = self.companies.get(1)
-            if not co1 or co1.name.lower() not in ("", "unnamed"):
-                return
-            if any(c.company_id == 1 for c in self.clients.values()):
+            if not co1 or co1.name.lower() not in ("", "unnamed") or any(c.company_id == 1 for c in self.clients.values()):
                 return
         try:
             await self.rcon("reset_company 1", console_wait="Company deleted")
@@ -319,12 +317,8 @@ class Bot:
         except Exception as e:
             self.log.error(f"Company data fetch error: {e}")
             return
-        updates = {}
-        for line in resp.splitlines():
-            m = _RCON_COMPANY_RE.match(line.strip())
-            if m:
-                cid = int(m.group(1))
-                updates[cid] = Company(name=m.group(2), founded=int(m.group(3)), value=int(m.group(4)))
+        updates = {int(m.group(1)): Company(name=m.group(2), founded=int(m.group(3)), value=int(m.group(4)))
+                   for line in resp.splitlines() if (m := _RCON_COMPANY_RE.match(line.strip()))}
         if not updates:
             return
         async with self._lock:
@@ -408,7 +402,7 @@ class Bot:
             if co in self._enforcing:
                 return
             self._enforcing.add(co)
-            client_name = self.clients.get(cid, Client("", 0)).name
+            client_name = getattr(self.clients.get(cid), "name", "")
         try:
             await asyncio.sleep(1.0)
             await self.rcon(f"move {cid} {SPECTATOR_ID}", console_wait="has joined spectators")
@@ -446,11 +440,9 @@ class Bot:
             return
         async with self._lock:
             client = self.clients.get(cid)
-            if client is None:
+            if client is None or client.name == "Admin":
                 return
             name, ip, paused = client.name, client.ip, self.is_paused
-        if name == "Admin":
-            return
         country = await self._get_country(ip)
         location = f" from {country}" if country else ""
         await self.msg(f"Welcome {name}{location}")
@@ -528,7 +520,6 @@ class Bot:
         self._spawn(_timeout(token))
 
     def _setup_handlers(self) -> None:
-
         @self.admin.add_handler(openttdpacket.ConsolePacket)
         async def on_console(admin: Admin, pkt: openttdpacket.ConsolePacket) -> None:
             msg = pkt.message.strip().lower()
