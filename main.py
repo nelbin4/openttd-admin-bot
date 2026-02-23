@@ -17,15 +17,18 @@ from typing import Any
 from aiopyopenttdadmin import Admin, AdminUpdateType, AdminUpdateFrequency, openttdpacket
 from pyopenttdadmin.enums import Actions, ChatDestTypes
 
-SPECTATOR_ID          = 255
-MAX_COMPANIES_PER_IP  = 2
-BROADCAST_INTERVAL    = 3600
-RCON_TIMEOUT          = 5
-GREETING_DELAY        = 5
-CHAT_COMMAND_COOLDOWN = 2
-RESET_CONFIRM_TIMEOUT = 15
-RECONNECT_DELAY       = 30
-MOVE_SETTLE_DELAY     = 0.5
+# Game configuration
+MAX_COMPANIES_PER_IP  = 2      # Maximum number of companies allowed per client IP
+BROADCAST_INTERVAL    = 3600   # Seconds between leaderboard broadcasts
+GREETING_DELAY        = 5      # Seconds to wait for client info before sending welcome message
+CHAT_COMMAND_COOLDOWN = 2      # Seconds between chat commands per client
+RESET_CONFIRM_TIMEOUT = 15     # Seconds client has to move to spectator to confirm company reset
+RECONNECT_DELAY       = 30     # Seconds to wait before attempting to reconnect
+
+# OpenTTD protocol
+SPECTATOR_ID          = 255    # Client ID for spectators in OpenTTD protocol
+RCON_TIMEOUT          = 5      # Default timeout for RCON commands in seconds
+MOVE_SETTLE_DELAY     = 0.5    # Seconds to wait after moving clients before proceeding
 
 _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
