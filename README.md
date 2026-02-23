@@ -47,11 +47,6 @@ USER botuser
 CMD ["python", "-u", "main.py"]
 ```
 
-## requirements.txt
-```
-aiopyopenttdadmin
-```
-
 ## Configuration — `settings.cfg`
 ```ini
 [server1]
