@@ -57,30 +57,30 @@ aiopyopenttdadmin
 [server1]
 ip = 127.0.0.1
 port = 3977
-admin_name = Admin
+admin_name = admin
 admin_pass = password
-map = competitive.sav
-goal = 100000000
-clean_age = 5
-clean_value = 100000
+map = somemap.scn
+goal = 500000
+clean_age = 3
+clean_value = 10000
 max_companies = 2
 broadcast_cv = 3600
 debug = false
 
-# this is how to add more server, uncomment below
-#[server2]
-#ip = 127.0.0.1
-#port = 3978
-#admin_name = Admin
-#admin_pass = password
-#map = casual.scn
-#goal = 50000000
-#clean_age = 3
-#clean_value = 50000
-#max_companies = 2
-#broadcast_cv = 3600
-#debug = false
+# [server2]
+# ip = 127.0.0.1
+# port = 3978
+# admin_name = admin
+# admin_pass = password
+# map = othermap.sav
+# goal = 500000
+# clean_age = 3
+# clean_value = 10000
+# max_companies = 2
+# broadcast_cv = 3600
+# debug = false
 ```
+Uncomment/remove "#" to enable
 
 Add more servers by adding `[server3]`, `[server4]`, etc.
 
