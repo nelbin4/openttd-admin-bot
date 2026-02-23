@@ -47,6 +47,11 @@ USER botuser
 CMD ["python", "-u", "main.py"]
 ```
 
+## requirements.txt
+```
+aiopyopenttdadmin
+```
+
 ## Configuration — `settings.cfg`
 ```ini
 [server1]
@@ -58,6 +63,8 @@ map = competitive.sav
 goal = 100000000
 clean_age = 5
 clean_value = 100000
+max_companies = 2
+broadcast_cv = 3600
 debug = false
 
 # this is how to add more server, uncomment below
@@ -70,6 +77,8 @@ debug = false
 #goal = 50000000
 #clean_age = 3
 #clean_value = 50000
+#max_companies = 2
+#broadcast_cv = 3600
 #debug = false
 ```
 Add more servers by adding `[server3]`, `[server4]`, etc.
@@ -84,7 +93,10 @@ Add more servers by adding `[server3]`, `[server4]`, etc.
 | `map` | string | Map to load after goal: `.sav`, `.scn`, or `newgame` |
 | `clean_age` | int | Minimum company age (years) to be eligible for auto-clean |
 | `clean_value` | int | Companies below this value get auto-cleaned |
+| `max_companies` | int | Maximum number of companies per client allowed |
+| `broadcast_cv` | int | Interval in seconds for company value leaderboard broadcasts |
 | `debug` | bool | Enable debug logging |
+Add `[server2]`, `[server3]`, etc. for additional servers.
 
 ## Chat Commands
 | Command | Description |
@@ -92,7 +104,7 @@ Add more servers by adding `[server3]`, `[server4]`, etc.
 | `!help` | List available commands |
 | `!info` | Game goal and mechanics |
 | `!rules` | Server rules and auto-clean thresholds |
-| `!cv` | Company value rankings (from 60s cache) |
+| `!cv` | Top 10 company value rankings (from 60s cache) |
 | `!reset` | Reset your company — move to spectator within 15s to confirm |
 
 Commands are blocked while the game is paused and rate-limited per client (2s cooldown).
