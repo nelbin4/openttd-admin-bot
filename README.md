@@ -80,9 +80,7 @@ debug = false
 # broadcast_cv = 3600
 # debug = false
 ```
-Uncomment/remove "#" to enable
-
-Add more servers by adding `[server3]`, `[server4]`, etc.
+Uncomment/remove "#" to enable. Add more servers by adding `[server3]`, `[server4]`, etc.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
