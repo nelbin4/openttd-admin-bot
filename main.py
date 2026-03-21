@@ -21,6 +21,13 @@ _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
 )
 
+_RECONNECT_DELAY   = 30       # seconds between reconnect attempts
+_RECV_TIMEOUT      = 0.1      # seconds for idle recv in main loop
+_COUNTRY_CACHE_MAX = 256      # max IP→country cache entries
+_CMD_COOLDOWN      = 2.0      # minimum seconds between !commands per client
+_RESET_TIMEOUT     = 15       # seconds for voluntary company reset confirmation
+_ADMIN_CLIENT_NAME = "Admin"  # name used by the admin login; skip greeting
+
 @dataclass
 class Company:
     name: str = ""
@@ -229,10 +236,14 @@ class Bot:
         await self._drain(timeout=0.5)
         await self._fetch_company_data()
 
-    async def _reset_state(self) -> None:
-        """Cancel all tasks, flush TCP debris, and clear all game state."""
+    async def _cancel_tasks(self) -> None:
+        """Cancel and await all tracked background tasks."""
         for t in self.tasks: t.cancel()
         await asyncio.gather(*self.tasks, return_exceptions=True)
+
+    async def _reset_state(self) -> None:
+        """Cancel all tasks, flush TCP debris, and clear all game state."""
+        await self._cancel_tasks()
         with contextlib.suppress(Exception):
             await self._drain(0.1)
         retry_at = asyncio.get_running_loop().time() + 0.5
@@ -419,7 +430,7 @@ class Bot:
             country = await asyncio.get_running_loop().run_in_executor(None, _fetch)
         except Exception:
             country = ""
-        if len(self._country_cache) >= 256:
+        if len(self._country_cache) >= _COUNTRY_CACHE_MAX:
             self._country_cache.pop(next(iter(self._country_cache)))
         self._country_cache[ip] = country
         return country
@@ -433,7 +444,7 @@ class Bot:
             return
         async with self._lock:
             client = self.clients.get(cid)
-            if client is None or client.name == "Admin":
+            if client is None or client.name == _ADMIN_CLIENT_NAME:
                 return
             name, ip, paused = client.name, client.ip, self.is_paused
         country = await self._get_country(ip)
@@ -459,7 +470,7 @@ class Bot:
             if self.is_paused:
                 return
             now = asyncio.get_running_loop().time()
-            if now - self.cooldowns.get(cid, 0) < 2:
+            if now - self.cooldowns.get(cid, 0) < _CMD_COOLDOWN:
                 return
             self.cooldowns[cid] = now
         cmd = parts[0]
@@ -501,15 +512,15 @@ class Bot:
             await self.msg("You must be in a company", cid)
             return
         self.log.info(f"Reset request: client #{cid} co#{co}")
-        await self.msg(f"Move to spectator in {15}s to reset company", cid)
+        await self.msg(f"Move to spectator in {_RESET_TIMEOUT}s to reset company", cid)
 
         async def _timeout(tok: float) -> None:
-            await asyncio.sleep(15)
+            await asyncio.sleep(_RESET_TIMEOUT)
             async with self._lock:
                 if self.reset_pending.get(cid, (None, None))[1] != tok:
                     return
                 self.reset_pending.pop(cid, None)
-            await self.msg(f"Reset timeout after {15}s", cid)
+            await self.msg(f"Reset timeout after {_RESET_TIMEOUT}s", cid)
         self._spawn(_timeout(token))
 
     def _setup_handlers(self) -> None:
@@ -639,8 +650,7 @@ class Bot:
     async def cleanup(self) -> None:
         """Cancel all tasks; Admin connection is closed by async-with in run()."""
         self.running = False
-        for t in self.tasks: t.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        await self._cancel_tasks()
         self.admin = None
 
     async def run(self) -> None:
@@ -670,7 +680,7 @@ class Bot:
                 while self.running:
                     try:
                         async with self._rcon_lock:
-                            packets = await asyncio.wait_for(admin.recv(), timeout=0.1)
+                            packets = await asyncio.wait_for(admin.recv(), timeout=_RECV_TIMEOUT)
                     except asyncio.TimeoutError:
                         packets = []
                     if not packets and admin._reader and admin._reader.at_eof():
@@ -698,12 +708,12 @@ async def run_bot(cfg: dict[str, Any], log: logging.Logger) -> None:
     while True:
         try:
             await Bot(cfg, log).run()
-            log.info(f"[{addr}] disconnected, reconnecting in {30}s...")
+            log.info(f"[{addr}] disconnected, reconnecting in {_RECONNECT_DELAY}s...")
         except (ConnectionError, OSError, TimeoutError):
-            log.warning(f"[{addr}] unavailable, retrying in {30}s...")
+            log.warning(f"[{addr}] unavailable, retrying in {_RECONNECT_DELAY}s...")
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
-        await asyncio.sleep(30)
+        await asyncio.sleep(_RECONNECT_DELAY)
 
 async def main() -> None:
     """Load settings.cfg, configure logging, launch one bot task per server."""
