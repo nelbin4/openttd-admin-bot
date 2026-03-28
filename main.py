@@ -21,12 +21,17 @@ _RCON_COMPANY_RE = re.compile(
     r"#:(\d+)\([^)]+\)\s+Company Name:\s+'([^']+)'\s+Year Founded:\s+(\d+).*?Value:\s+(\d+)"
 )
 
-_RECONNECT_DELAY   = 30       # seconds between reconnect attempts
-_RECV_TIMEOUT      = 0.1      # seconds for idle recv in main loop
-_COUNTRY_CACHE_MAX = 256      # max IP→country cache entries
-_CMD_COOLDOWN      = 2.0      # minimum seconds between !commands per client
-_RESET_TIMEOUT     = 15       # seconds for voluntary company reset confirmation
-_ADMIN_CLIENT_NAME = "Admin"  # name used by the admin login; skip greeting
+_RECONNECT_DELAY        = 30       # seconds between reconnect attempts
+_RECV_TIMEOUT           = 1.0      # seconds for idle recv in main loop
+_COUNTRY_CACHE_MAX      = 256      # max IP→country cache entries
+_CMD_COOLDOWN           = 2.0      # minimum seconds between !commands per client
+_RESET_TIMEOUT          = 15       # seconds for voluntary company reset confirmation
+_ADMIN_CLIENT_NAME      = "Admin"  # name used by the admin login; skip greeting
+_SPECTATOR              = 255      # company ID sentinel for spectators
+_RCON_JOINED_SPEC       = "has joined spectators"
+_RCON_CO_DELETED        = "Company deleted"
+_MAP_NEWGAME            = "newgame"
+_COOLDOWN_TTL           = 300      # seconds before idle cooldown entries are evicted
 
 @dataclass
 class Company:
@@ -112,8 +117,8 @@ class Bot:
 
     @staticmethod
     def _to_cid(raw: int) -> int:
-        """0-based → 1-based company ID; 255 (spectator) unchanged."""
-        return 255 if raw == 255 else raw + 1
+        """0-based → 1-based company ID; spectator unchanged."""
+        return _SPECTATOR if raw == _SPECTATOR else raw + 1
 
     def _spawn(self, coro) -> asyncio.Task:
         """Fire-and-forget task; auto-removes from self.tasks on completion."""
@@ -124,11 +129,11 @@ class Bot:
 
     def _pkt_cid(self, pkt: Any) -> int:
         """Extract 1-based company ID from a client packet."""
-        return self._to_cid(getattr(pkt, "play_as", getattr(pkt, "company_id", 255)))
+        return self._to_cid(getattr(pkt, "play_as", getattr(pkt, "company_id", _SPECTATOR)))
 
     def _check_ownership(self, client_id: int, co: int) -> bool:
         """Assign ownership if new; return True if client exceeded max_companies limit. Call under _lock."""
-        if co == 255 or co not in self.companies or co in self._enforcing or co in self.company_owners:
+        if co == _SPECTATOR or co not in self.companies or co in self._enforcing or co in self.company_owners:
             return False
         if sum(1 for v in self.company_owners.values() if v == client_id) >= self.cfg["max_companies"]:
             return True
@@ -271,7 +276,7 @@ class Bot:
             if not co1 or co1.name.lower() not in ("", "unnamed") or any(c.company_id == 1 for c in self.clients.values()):
                 return
         try:
-            await self.rcon("reset_company 1", console_wait="Company deleted")
+            await self.rcon("reset_company 1", console_wait=_RCON_CO_DELETED)
             self.log.info("Reset default company #1")
         except Exception as e:
             self.log.debug(f"reset_company 1: {e}")
@@ -309,7 +314,6 @@ class Bot:
         while self.running:
             await asyncio.sleep(60 - time.time() % 60)
             if not self.is_paused:
-                self.log.debug("Poll: fetching company data")
                 await self._fetch_company_data()
 
     async def _fetch_company_data(self) -> None:
@@ -355,7 +359,7 @@ class Bot:
                 await self.msg(f"Map reloads in {t}s...")
                 await asyncio.sleep(5)
             map_file = self.cfg["map"]
-            cmd = "newgame" if not map_file or map_file == "newgame" else (
+            cmd = _MAP_NEWGAME if not map_file or map_file == _MAP_NEWGAME else (
                 f"load_scenario {map_file}" if map_file.endswith(".scn") else f"load {map_file}")
             self._new_game_event.clear()
             await self.rcon(cmd)
@@ -384,13 +388,13 @@ class Bot:
             age = self.game_year - founded
             try:
                 for c in clients:
-                    await self.rcon(f"move {c} {255}", console_wait="has joined spectators")
+                    await self.rcon(f"move {c} {_SPECTATOR}", console_wait=_RCON_JOINED_SPEC)
                 if clients:
                     await asyncio.sleep(0.5)
-                await self.rcon(f"reset_company {cid}", console_wait="Company deleted")
+                await self.rcon(f"reset_company {cid}", console_wait=_RCON_CO_DELETED)
                 async with self._lock:
                     self._remove_company(cid)
-                self.log.info(f"Auto-clean: co#{cid} '{name}' age={age}yrs val={value}")
+                self.log.info(f"Auto-clean: co#{cid} '{name}' age={age}yrs val={fmt(value)}")
                 await self.msg(f"Company {name} auto-reset")
                 await self.apply_pause_policy()
             except Exception as e:
@@ -407,7 +411,7 @@ class Bot:
             client_name = getattr(self.clients.get(cid), "name", "")
         try:
             await asyncio.sleep(1.0)
-            await self.rcon(f"move {cid} {255}", console_wait="has joined spectators")
+            await self.rcon(f"move {cid} {_SPECTATOR}", console_wait=_RCON_JOINED_SPEC)
             await self.rcon(f"reset_company {co}")
             await self.msg(f"Only {self.cfg['max_companies']} companies per client allowed.", cid)
             self.log.info(f"Enforced limit: moved '{client_name}' to spectator, reset co#{co}")
@@ -472,6 +476,7 @@ class Bot:
             now = asyncio.get_running_loop().time()
             if now - self.cooldowns.get(cid, 0) < _CMD_COOLDOWN:
                 return
+            self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < _COOLDOWN_TTL}
             self.cooldowns[cid] = now
         cmd = parts[0]
         self.log.debug(f"Command: !{cmd} from #{cid}")
@@ -482,7 +487,8 @@ class Bot:
                     f"Goal: first company to reach {fmt(self.cfg['goal'])} wins!\n"
                     f"Gamescript: Production Booster\n"
                     f"Primary industries (coal, wood, oil, etc.)\n"
-                    f"Transported >70% increases production, <50% decreases", cid)
+                    f"Transported >70% increases production, <50% decreases\n"
+                    f"Get Admin for your server: github.com/nelbin4/openttd-admin-bot", cid)
             elif cmd == "rules":
                 await self.msg(
                     f"=== Game Rules ===\n"
@@ -505,10 +511,10 @@ class Bot:
         """Register voluntary company reset; prompt client to move to spectator."""
         token = asyncio.get_running_loop().time()
         async with self._lock:
-            co = self.clients.get(cid, Client("", 255)).company_id
-            if co != 255:
+            co = self.clients.get(cid, Client("", _SPECTATOR)).company_id
+            if co != _SPECTATOR:
                 self.reset_pending[cid] = (co, token)
-        if co == 255:
+        if co == _SPECTATOR:
             await self.msg("You must be in a company", cid)
             return
         self.log.info(f"Reset request: client #{cid} co#{co}")
@@ -570,15 +576,15 @@ class Bot:
                 else:
                     self.clients[pkt.id] = Client(name=pkt.name, company_id=co)
                 enforce_limit = self._check_ownership(pkt.id, co)
-                if co == 255:
+                if co == _SPECTATOR:
                     if pending := self.reset_pending.pop(pkt.id, None):
-                        pending_co = pending[0]
+                        pending_co, _ = pending
             if enforce_limit:
                 self.log.warning(f"Client #{pkt.id} exceeded limit, removing co#{co}")
                 self._spawn(self._enforce_limit(pkt.id, co))
                 return
             if pending_co is not None:
-                await self.rcon(f"reset_company {pending_co}", console_wait="Company deleted")
+                await self.rcon(f"reset_company {pending_co}", console_wait=_RCON_CO_DELETED)
                 await self.msg(f"Company #{pending_co} reset", pkt.id)
                 async with self._lock:
                     self._remove_company(pending_co)
@@ -625,9 +631,13 @@ class Bot:
 
         @self.admin.add_handler(openttdpacket.DatePacket)
         async def on_date(admin: Admin, pkt: openttdpacket.DatePacket):
+            if pkt.date == self.game_date:
+                return
             d = date(1, 1, 1) + timedelta(days=pkt.date)
-            self.game_year = d.year - 1
             self.game_date = pkt.date
+            new_year = d.year - 1
+            if new_year != self.game_year:
+                self.game_year = new_year
             self.log.debug(f"Date: {d.month:02d}-{d.day:02d}-{d.year - 1}")
 
         @self.admin.add_handler(openttdpacket.NewGamePacket)
@@ -636,7 +646,6 @@ class Bot:
             await self._reset_state()
             await self._snapshot_state()
             await asyncio.sleep(1.0)
-            await self._fetch_company_data()
             await self._reset_company_1()
             await self.apply_pause_policy()
             self._spawn(self._poll_loop())
@@ -676,7 +685,9 @@ class Bot:
                 await self.msg("Admin connected")
                 self._spawn(self._poll_loop())
                 loop = asyncio.get_running_loop()
-                next_broadcast = loop.time() + self.cfg["broadcast_cv"]
+                bcast_iv = self.cfg["broadcast_cv"]
+                t = time.time()
+                next_broadcast = t + (bcast_iv - t % bcast_iv)
                 while self.running:
                     try:
                         async with self._rcon_lock:
@@ -688,13 +699,15 @@ class Bot:
                     for pkt in packets:
                         await admin.handle_packet(pkt)
                     now = loop.time()
+                    wall_now = time.time()
                     if self._pause_retry_at and now >= self._pause_retry_at:
                         self._pause_retry_at = 0.0
                         await self.apply_pause_policy()
-                    if not self.is_paused and now >= next_broadcast:
+                    if not self.is_paused and wall_now >= next_broadcast:
                         await self.msg(self._leaderboard())
                         self.log.info("Broadcast leaderboard")
-                        next_broadcast = now + self.cfg["broadcast_cv"]
+                        t = time.time()
+                        next_broadcast = t + (bcast_iv - t % bcast_iv)
         except Exception as e:
             if not isinstance(e, (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)):
                 self.log.error(f"Bot run error: {e}", exc_info=True)
