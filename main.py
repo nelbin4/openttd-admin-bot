@@ -30,17 +30,13 @@ _RCON_COMPANY_RE = re.compile(
 
 _RECONNECT_DELAY = 30  # initial seconds between reconnect attempts
 _RECONNECT_MAX_DELAY = 300
-_RECV_TIMEOUT = 0.2  # seconds for idle recv in main loop
-_RCON_WAIT_RETRY = 0.01  # prevents a CPU spin while RCON owns the reader
 _CMD_COOLDOWN = 1.0  # minimum seconds between !commands per client
 _RESET_TIMEOUT = 15  # seconds for voluntary company reset confirmation
-_ADMIN_CLIENT_NAME = "Admin"  # name used by the admin login; skip greeting
 _SPECTATOR = 255  # company ID sentinel for spectators
 _RCON_JOINED_SPEC = "has joined spectators"
 _RCON_CO_DELETED = "Company deleted"
 _MAP_NEWGAME = "newgame"
 _COOLDOWN_TTL = 300  # seconds before idle cooldown entries are evicted
-_DEFAULT_COMPANY_NAME = "unnamed"
 _MAX_DISPLAY_TEXT = 80
 _MAX_CHAT_LINE = 200
 _CONSOLE_PAUSED = "game paused"
@@ -157,12 +153,15 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     max_co = cfg.get("max_companies", 2)
     if not isinstance(max_co, int) or not 1 <= max_co <= 64:
         errors.append(f"Invalid max_companies: {max_co!r} (expected 1-64)")
+    cfg["max_companies"] = max_co
     bcast = cfg.get("broadcast_cv", 3600)
     if not isinstance(bcast, int) or not 1 <= bcast <= 86400:
         errors.append(f"Invalid broadcast_cv: {bcast!r} (expected 1-86400 seconds)")
+    cfg["broadcast_cv"] = bcast
     goal = cfg.get("goal", 0)
     if not isinstance(goal, int) or goal < 0:
         errors.append(f"Invalid goal: {goal!r} (expected a non-negative integer)")
+    cfg["goal"] = goal
     clean_age = cfg.get("clean_age", 0)
     clean_value = cfg.get("clean_value", 0)
     if not isinstance(clean_age, int) or clean_age < 0:
@@ -171,6 +170,8 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
         errors.append(f"Invalid clean_value: {clean_value!r} (expected zero or positive)")
     if bool(clean_age) != bool(clean_value):
         errors.append("clean_age and clean_value must both be zero or both be positive")
+    cfg["clean_age"] = clean_age
+    cfg["clean_value"] = clean_value
     map_file = cfg.get("map", "")
     if not isinstance(map_file, str) or (
         map_file
@@ -290,6 +291,7 @@ class Bot:
         await self._reset_company_1()
         await self.apply_pause_policy()
         self._spawn(self._poll_loop())
+        self._spawn(self._maintenance_loop())
 
     async def _poll(self, update_type: AdminUpdateType, data: int) -> None:
         """Send raw ADMIN_POLL packet."""
@@ -388,14 +390,14 @@ class Bot:
                     self.log.error(f"msg error: {e}")
 
     async def _snapshot_state(self) -> None:
-        """Poll date/clients/companies until a date packet arrives, then drain."""
+        """Poll clients/companies once, then poll date until it arrives."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 10
+        await self._poll(AdminUpdateType.CLIENT_INFO, 0xFFFFFFFF)
+        for cid in range(15):
+            await self._poll(AdminUpdateType.COMPANY_INFO, cid)
         while True:
             await self._poll(AdminUpdateType.DATE, 0)
-            await self._poll(AdminUpdateType.CLIENT_INFO, 0xFFFFFFFF)
-            for cid in range(16):
-                await self._poll(AdminUpdateType.COMPANY_INFO, cid)
             await self._drain(timeout=0.2)
             if self.game_date or loop.time() > deadline:
                 break
@@ -438,7 +440,7 @@ class Bot:
             co1 = self.companies.get(1)
             if (
                 not co1
-                or co1.name.lower() not in ("", _DEFAULT_COMPANY_NAME)
+                or co1.name.lower() not in ("", "unnamed")
                 or any(c.company_id == 1 for c in self.clients.values())
             ):
                 return
@@ -468,7 +470,7 @@ class Bot:
             already = _RESP_ALREADY_PAUSED if should_pause else _RESP_ALREADY_UNPAUSED
             if already not in resp.lower():
                 reason = "no companies" if should_pause else "company present"
-                self.log.info(f"{self.cfg['name'].capitalize()}: {reason}")
+                self.log.info(f"{state.capitalize()}d: {reason}")
         except Exception as e:
             async with self._lock:
                 if self.last_pause_cmd == should_pause:
@@ -482,6 +484,32 @@ class Bot:
             await asyncio.sleep(60 - time.time() % 60)
             if not self.is_paused:
                 await self._fetch_company_data()
+
+    async def _maintenance_loop(self) -> None:
+        """Retry pause policy and broadcast the leaderboard on a fixed cadence.
+
+        Runs independently of the main recv loop so these checks aren't delayed
+        by however long an in-flight RCON call holds `_rcon_lock`.
+        """
+        bcast_iv = self.cfg["broadcast_cv"]
+        if not isinstance(bcast_iv, int) or bcast_iv <= 0:
+            bcast_iv = 3600
+
+        def _next_bcast() -> float:
+            t = time.time()
+            return t + (bcast_iv - t % bcast_iv)
+
+        next_broadcast = _next_bcast()
+        loop = asyncio.get_running_loop()
+        while self.running:
+            await asyncio.sleep(1.0)
+            if self._pause_retry_at and loop.time() >= self._pause_retry_at:
+                self._pause_retry_at = 0.0
+                await self.apply_pause_policy()
+            if not self.is_paused and time.time() >= next_broadcast:
+                await self.msg(self._leaderboard())
+                self.log.info("Broadcast leaderboard")
+                next_broadcast = _next_bcast()
 
     async def _fetch_company_data(self) -> None:
         """Fetch 'rcon companies', update cache, then check goal and auto-clean."""
@@ -651,7 +679,7 @@ class Bot:
             return
         async with self._lock:
             client = self.clients.get(cid)
-            if client is None or client.name == _ADMIN_CLIENT_NAME:
+            if client is None or client.name == "Admin":  # admin login itself; skip greeting
                 return
             name, ip, _ = clean_display_text(client.name), client.ip, self.is_paused
         await asyncio.sleep(5)
@@ -813,12 +841,15 @@ class Bot:
                 self._spawn(self._enforce_limit(pkt.id, co))
                 return
             if pending_co is not None:
-                await self.rcon(f"reset_company {pending_co}", console_wait=_RCON_CO_DELETED)
-                await self.msg(f"Company #{pending_co} reset", pkt.id)
-                async with self._lock:
-                    self._remove_company(pending_co)
-                self.log.info(f"Reset complete: co#{pending_co}")
-                await self.apply_pause_policy()
+                try:
+                    await self.rcon(f"reset_company {pending_co}", console_wait=_RCON_CO_DELETED)
+                    await self.msg(f"Company #{pending_co} reset", pkt.id)
+                    async with self._lock:
+                        self._remove_company(pending_co)
+                    self.log.info(f"Reset complete: co#{pending_co}")
+                    await self.apply_pause_policy()
+                except Exception as e:
+                    self.log.error(f"Reset error co#{pending_co}: {e}")
 
         @admin.add_handler(openttdpacket.ClientQuitPacket, openttdpacket.ClientErrorPacket)
         async def on_client_disconnect(admin: Admin, pkt: Any) -> None:
@@ -917,41 +948,16 @@ class Bot:
                 self.running = True
                 self.log.info(f"Connected to {self.cfg['ip']}:{self.cfg['port']}")
                 await self.msg("Admin connected")
-                loop = asyncio.get_running_loop()
-                bcast_iv = self.cfg["broadcast_cv"]
-                if not isinstance(bcast_iv, int) or bcast_iv <= 0:
-                    bcast_iv = 3600
-
-                def _next_bcast() -> float:
-                    t = time.time()
-                    return t + (bcast_iv - t % bcast_iv)
-
-                next_broadcast = _next_bcast()
                 while self.running:
-                    packets = []
-                    if not self._rcon_lock.locked():
-                        try:
-                            async with self._rcon_lock:
-                                packets = await asyncio.wait_for(
-                                    admin.recv(), timeout=_RECV_TIMEOUT
-                                )
-                        except TimeoutError:
-                            packets = []
-                    else:
-                        await asyncio.sleep(_RCON_WAIT_RETRY)
+                    try:
+                        async with self._rcon_lock:
+                            packets = await asyncio.wait_for(admin.recv(), timeout=0.5)
+                    except TimeoutError:
+                        packets = []
                     if not packets and self.transport and self.transport.at_eof:
                         raise ConnectionError("Admin connection closed (EOF)")
                     for pkt in packets:
                         await admin.handle_packet(pkt)
-                    now = loop.time()
-                    wall_now = time.time()
-                    if self._pause_retry_at and now >= self._pause_retry_at:
-                        self._pause_retry_at = 0.0
-                        await self.apply_pause_policy()
-                    if not self.is_paused and wall_now >= next_broadcast:
-                        await self.msg(self._leaderboard())
-                        self.log.info("Broadcast leaderboard")
-                        next_broadcast = _next_bcast()
         except Exception as e:
             if not isinstance(e, ConnectionError | OSError | TimeoutError):
                 self.log.error(f"Bot run error: {e}", exc_info=True)
@@ -961,21 +967,24 @@ class Bot:
 
 
 async def run_bot(cfg: ServerConfig, log: logging.Logger) -> None:
-    """Run bot with automatic reconnect on connection failures."""
+    """Run bot with automatic reconnect; backoff resets after a stable connection."""
     addr = f"{cfg['ip']}:{cfg['port']}"
     retry_delay = _RECONNECT_DELAY
     while True:
+        connected_at = time.monotonic()
         try:
             await Bot(cfg, log).run()
-            retry_delay = _RECONNECT_DELAY
-            log.info(f"[{addr}] disconnected, reconnecting in {retry_delay}s...")
+            log.info(f"[{addr}] disconnected")
         except (ConnectionError, OSError, TimeoutError):
-            log.warning(f"[{addr}] unavailable, retrying in {retry_delay}s...")
+            log.warning(f"[{addr}] unavailable")
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
-        await asyncio.sleep(retry_delay)
-        if retry_delay < _RECONNECT_MAX_DELAY:
+        if time.monotonic() - connected_at >= _RECONNECT_DELAY:
+            retry_delay = _RECONNECT_DELAY
+        else:
             retry_delay = min(retry_delay * 2, _RECONNECT_MAX_DELAY)
+        log.info(f"[{addr}] reconnecting in {retry_delay}s...")
+        await asyncio.sleep(retry_delay)
 
 
 async def main() -> None:
