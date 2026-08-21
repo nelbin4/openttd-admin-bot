@@ -301,7 +301,14 @@ class Bot:
         await transport.poll(update_type, data)
 
     async def _drain(self, timeout: float = 0.5) -> None:
-        """Dispatch packets until stream is idle; re-entrancy guard prevents recursion."""
+        """Dispatch packets until stream is idle.
+
+        Re-entrancy guard: nothing in this file currently calls _drain()
+        from within a packet handler it would itself invoke, but the depth
+        cap protects against that if it's ever introduced (depth 1 = a
+        normal top-level call already in progress; depth 2 blocks a second
+        nested call rather than recursing unboundedly).
+        """
         if self._drain_depth >= 2:
             return
         self._drain_depth += 1
@@ -492,8 +499,6 @@ class Bot:
         by however long an in-flight RCON call holds `_rcon_lock`.
         """
         bcast_iv = self.cfg["broadcast_cv"]
-        if not isinstance(bcast_iv, int) or bcast_iv <= 0:
-            bcast_iv = 3600
 
         def _next_bcast() -> float:
             t = time.time()
@@ -575,9 +580,22 @@ class Bot:
             )
             self._new_game_event.clear()
             await self.rcon(cmd)
-            await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
         except Exception as e:
+            # The reload command itself never got through — nothing is now in
+            # progress server-side, so clear goal_reached to allow a retry on
+            # the next poll tick. Otherwise the win condition would be stuck
+            # forever until the process restarts.
             self.log.error(f"Map reload error: {e}")
+            self.goal_reached = False
+            return
+        try:
+            await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
+        except TimeoutError:
+            # The command was accepted; the reload may just be taking longer
+            # than 10s. Leave goal_reached as-is — on_new_game's own
+            # _reset_state() will clear it once the real reload lands, and
+            # resetting here risks a double-triggered reload racing it.
+            self.log.warning("Map reload: newgame not observed within 10s")
 
     async def auto_clean(self) -> None:
         """Reset old low-value companies. Moves clients first, then resets."""
@@ -681,7 +699,7 @@ class Bot:
             client = self.clients.get(cid)
             if client is None or client.name == "Admin":  # admin login itself; skip greeting
                 return
-            name, ip, _ = clean_display_text(client.name), client.ip, self.is_paused
+            name, ip, _ = client.name, client.ip, self.is_paused
         await asyncio.sleep(5)
         if not self.running:
             return
@@ -741,13 +759,18 @@ class Bot:
                     cid,
                 )
             elif cmd == "rules":
+                clean_rule = (
+                    f"4. Companies >{self.cfg['clean_age']}yrs & value "
+                    f"<{fmt(self.cfg['clean_value'])} auto-cleaned\n"
+                    if self.cfg["clean_age"]
+                    else "4. Auto-clean is disabled on this server\n"
+                )
                 await self.msg(
                     f"=== Game Rules ===\n"
                     f"1. No sabotage, respect other players\n"
                     f"2. No griefing or blocking industries/cities\n"
                     f"3. Do not excessively reserve land\n"
-                    f"4. Companies >{self.cfg['clean_age']}yrs & value "
-                    f"<{fmt(self.cfg['clean_value'])} auto-cleaned\n"
+                    f"{clean_rule}"
                     f"5. Only {self.cfg['max_companies']} companies allowed per client",
                     cid,
                 )
