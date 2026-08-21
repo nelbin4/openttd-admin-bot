@@ -6,6 +6,7 @@ import contextlib
 import ipaddress
 import json
 import logging
+import os
 import re
 import signal
 import time
@@ -30,6 +31,7 @@ _RCON_COMPANY_RE = re.compile(
 
 _RECONNECT_DELAY = 30  # initial seconds between reconnect attempts
 _RECONNECT_MAX_DELAY = 300
+_GOAL_RELOAD_MAX_RETRIES = 3  # give up re-announcing/retrying after this many failed reloads
 _CMD_COOLDOWN = 1.0  # minimum seconds between !commands per client
 _RESET_TIMEOUT = 15  # seconds for voluntary company reset confirmation
 _SPECTATOR = 255  # company ID sentinel for spectators
@@ -84,6 +86,7 @@ class ServerConfig(TypedDict):
     clean_value: int
     max_companies: int
     broadcast_cv: int
+    geo_lookup: bool
 
 
 def clean_display_text(value: Any, limit: int = _MAX_DISPLAY_TEXT) -> str:
@@ -142,6 +145,11 @@ def load_config(path: str = "settings.cfg") -> list[dict[str, Any]]:
 
 def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
     """Validate and normalize config in-place; return fatal error strings."""
+    # OPENTTD_ADMIN_PASS_<SECTION> lets a deployment inject the password via
+    # env var / Docker secret instead of plaintext in settings.cfg.
+    env_key = "OPENTTD_ADMIN_PASS_" + re.sub(r"[^A-Za-z0-9]", "_", str(cfg.get("name", ""))).upper()
+    if env_pass := os.environ.get(env_key):
+        cfg["admin_pass"] = env_pass
     for field in ("ip", "port", "admin_name", "admin_pass"):
         if not cfg.get(field):
             return [f"Missing required field: {field}"]
@@ -150,6 +158,7 @@ def normalize_config(cfg: dict[str, Any], log: logging.Logger) -> list[str]:
         errors.append(f"Invalid port: {cfg.get('port')}")
     cfg.setdefault("debug", False)
     cfg.setdefault("map", "")
+    cfg.setdefault("geo_lookup", False)  # off by default: sends player IPs to ipapi.co
     max_co = cfg.get("max_companies", 2)
     if not isinstance(max_co, int) or not 1 <= max_co <= 64:
         errors.append(f"Invalid max_companies: {max_co!r} (expected 1-64)")
@@ -218,6 +227,8 @@ class Bot:
         self._country_sem = asyncio.Semaphore(8)
         self._drain_depth = 0
         self._last_cooldown_gc = 0.0
+        self._parse_failures = 0
+        self._goal_reload_failures = 0
 
     @staticmethod
     def _to_cid(raw: int) -> int:
@@ -431,6 +442,7 @@ class Bot:
             self.game_year = self.game_date = 0
             self.is_paused = True
             self.goal_reached = False
+            self._goal_reload_failures = 0
             self.reset_pending.clear()
             self.cooldowns.clear()
             self._cleaning.clear()
@@ -532,11 +544,22 @@ class Bot:
         }
         if not updates:
             if resp.strip():
-                self.log.error(
-                    f"rcon 'companies' returned no parseable lines "
-                    f"({len(resp.splitlines())} total): {resp[:200]!r}"
-                )
+                self._parse_failures += 1
+                # Log loudly on the 1st and 5th consecutive failure (fast
+                # signal that this is a real, ongoing problem, not a blip),
+                # then remind every 30 minutes rather than spamming every
+                # single minute forever.
+                if self._parse_failures in (1, 5) or self._parse_failures % 30 == 0:
+                    self.log.error(
+                        f"rcon 'companies' returned no parseable lines for "
+                        f"{self._parse_failures} consecutive poll(s) — goal "
+                        f"detection and auto-clean are non-functional until "
+                        f"this is fixed. Check the OpenTTD server's version/"
+                        f"locale against this bot's expected output format. "
+                        f"Last response: {resp[:200]!r}"
+                    )
             return
+        self._parse_failures = 0
         async with self._lock:
             for cid, data in updates.items():
                 if cid not in self.companies:
@@ -582,20 +605,46 @@ class Bot:
             await self.rcon(cmd)
         except Exception as e:
             # The reload command itself never got through — nothing is now in
-            # progress server-side, so clear goal_reached to allow a retry on
-            # the next poll tick. Otherwise the win condition would be stuck
-            # forever until the process restarts.
+            # progress server-side. Retry a bounded number of times rather
+            # than forever, so a persistently broken map config doesn't
+            # re-announce and re-attempt indefinitely.
             self.log.error(f"Map reload error: {e}")
-            self.goal_reached = False
+            self._goal_reload_failed()
             return
         try:
             await asyncio.wait_for(self._new_game_event.wait(), timeout=10)
         except TimeoutError:
-            # The command was accepted; the reload may just be taking longer
-            # than 10s. Leave goal_reached as-is — on_new_game's own
-            # _reset_state() will clear it once the real reload lands, and
-            # resetting here risks a double-triggered reload racing it.
-            self.log.warning("Map reload: newgame not observed within 10s")
+            # The command was accepted, but some maps genuinely take a while
+            # to load — give it a longer grace period before concluding the
+            # reload silently failed server-side (bad/missing file, etc.).
+            try:
+                await asyncio.wait_for(self._new_game_event.wait(), timeout=50)
+            except TimeoutError:
+                self.log.error(
+                    "Map reload: no newgame observed after 60s total; "
+                    "assuming the reload failed"
+                )
+                self._goal_reload_failed()
+                return
+        self._goal_reload_failures = 0
+
+    def _goal_reload_failed(self) -> None:
+        """Allow a retry on the next poll tick, up to a bounded number of
+        consecutive failures. Beyond that, give up permanently for this
+        connection rather than re-announcing/re-attempting every ~90s
+        forever — a persistently broken map config needs a human to fix it.
+        """
+        self._goal_reload_failures += 1
+        if self._goal_reload_failures >= _GOAL_RELOAD_MAX_RETRIES:
+            self.log.error(
+                f"Map reload failed {self._goal_reload_failures} consecutive "
+                f"times — giving up. The win will not be re-announced or "
+                f"retried until this bot reconnects or restarts. Check that "
+                f"'map' in settings.cfg points to a file that actually "
+                f"exists on the server."
+            )
+            return
+        self.goal_reached = False
 
     async def auto_clean(self) -> None:
         """Reset old low-value companies. Moves clients first, then resets."""
@@ -703,7 +752,7 @@ class Bot:
         await asyncio.sleep(5)
         if not self.running:
             return
-        country = await self._lookup_country(ip)
+        country = await self._lookup_country(ip) if self.cfg.get("geo_lookup") else ""
         location = f" from {country}" if country else ""
         await self.msg(f"Welcome {name}{location}")
         hint = (
